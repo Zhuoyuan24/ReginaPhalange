@@ -14,7 +14,6 @@ st.write("Hello, *World!* :sunglasses:")
 # Program title: Storytelling App
 
 # Import part
-import streamlit as st
 from transformers import pipeline
 
 # Function part
