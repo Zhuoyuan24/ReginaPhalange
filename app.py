@@ -10,26 +10,69 @@ st.header("Header")
 st.subheader("Sub-header")
 
 st.write("Hello, *World!* :sunglasses:")
-
+import streamlit as st
 from transformers import pipeline
 from PIL import Image
 
-# Streamlit UI
-print("Title: Age Classification using ViT")
+# -----------------------------
+# Streamlit page setup
+# -----------------------------
+st.set_page_config(
+    page_title="Age Classification App",
+    page_icon="🧑",
+    layout="centered"
+)
 
-# Load the age classification pipeline
-# The code below should be placed in the main part of the program
-age_classifier = pipeline("image-classification",
-                          model="nateraw/vit-age-classifier")
+st.title("🧑 Age Classification using ViT")
+st.write("Upload a face image, and the model will predict the person's age range.")
 
-image_name = "middleagedMan.jpg"
-image_name = Image.open(image_name).convert("RGB")
+# -----------------------------
+# Load model only once
+# -----------------------------
+@st.cache_resource
+def load_age_classifier():
+    return pipeline(
+        "image-classification",
+        model="nateraw/vit-age-classifier"
+    )
 
-# Classify age
-age_predictions = age_classifier(image_name)
-print(age_predictions)
-age_predictions = sorted(age_predictions, key=lambda x: x['score'], reverse=True)
+age_classifier = load_age_classifier()
 
-# Display results
-print("Predicted Age Range:")
-print(f"Age range: {age_predictions[0]['label']}")
+# -----------------------------
+# Upload image
+# -----------------------------
+uploaded_file = st.file_uploader(
+    "Upload an image",
+    type=["jpg", "jpeg", "png"]
+)
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+
+    st.image(image, caption="Uploaded Image", use_container_width=True)
+
+    with st.spinner("Classifying age..."):
+        age_predictions = age_classifier(image)
+
+    age_predictions = sorted(
+        age_predictions,
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    top_prediction = age_predictions[0]
+
+    st.subheader("Predicted Age Range")
+    st.success(f"Age range: {top_prediction['label']}")
+
+    st.subheader("Prediction Details")
+
+    for prediction in age_predictions:
+        label = prediction["label"]
+        score = prediction["score"]
+
+        st.write(f"{label}: {score:.2%}")
+        st.progress(score)
+
+else:
+    st.info("Please upload an image to start age classification.")
