@@ -36,15 +36,15 @@ from transformers import (
 # 2. MODEL SETTINGS
 # ----------------------------
 
-# Image captioning model suggested by professor
+# Professor-suggested image captioning model
 IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# Extra image understanding model
-# Used only to extract character, setting, and activity
+# Extra image-understanding model
+# Used to extract character, setting, activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
 # Better story generation model
-# FLAN-T5 follows instructions better than the earlier story generator model
+# FLAN-T5 follows instructions better than the earlier story generator model.
 STORY_MODEL = "google/flan-t5-base"
 
 
@@ -66,8 +66,9 @@ def load_image_captioning_model():
     """
     Load BLIP image captioning model.
 
-    This replaces pipeline("image-to-text") because some Streamlit Cloud
-    environments no longer recognize the image-to-text pipeline task name.
+    We use BlipProcessor and BlipForConditionalGeneration directly
+    because some Streamlit Cloud environments may not recognize
+    pipeline("image-to-text").
     """
     device = get_torch_device()
 
@@ -85,10 +86,11 @@ def load_vqa_model():
     """
     Load visual question answering model.
 
-    This model helps extract simple image details:
+    This model helps extract:
     - character
     - setting
     - activity
+    - weather / environment
     """
     device = get_torch_device()
 
@@ -104,7 +106,7 @@ def load_vqa_model():
 @st.cache_resource(show_spinner="Loading story generation model...")
 def load_story_model():
     """
-    Load FLAN-T5 model for story generation.
+    Load FLAN-T5 model for instruction-following story generation.
     """
     device = get_torch_device()
 
@@ -287,6 +289,36 @@ def choose_activity(caption: str, activity_answer: str) -> str:
     return "enjoying the moment"
 
 
+def choose_weather(caption: str, weather_answer: str, setting: str) -> str:
+    """
+    Convert weather/environment information into natural English.
+    """
+    combined = f"{caption} {weather_answer} {setting}".lower()
+
+    if "snow" in combined or "snowy" in combined:
+        return "snowy and cold"
+
+    if "sunny" in combined or "sun" in combined:
+        return "sunny and bright"
+
+    if "rain" in combined or "rainy" in combined:
+        return "rainy"
+
+    if "cloud" in combined or "cloudy" in combined:
+        return "cloudy"
+
+    if "ocean" in combined or "sea" in combined:
+        return "calm and breezy"
+
+    if "gym" in combined or "inside" in combined or "indoor" in combined:
+        return "indoors"
+
+    if weather_answer not in ["unknown", "none", ""]:
+        return weather_answer
+
+    return "pleasant"
+
+
 def img2text(url: str) -> str:
     """
     Convert uploaded image into a concise scenario.
@@ -297,9 +329,10 @@ def img2text(url: str) -> str:
             text = ...
             return text
 
-    This function extracts only the useful story information:
+    Extracted components:
     - Character
     - Setting
+    - Weather / environment
     - Activity
     - Original image caption
     """
@@ -308,19 +341,22 @@ def img2text(url: str) -> str:
     # Basic image caption
     caption = generate_basic_caption(image)
 
-    # Ask a few visual questions
+    # Ask visual questions
     character_answer = ask_vqa_question(image, "Who is the main character in the image?")
     setting_answer = ask_vqa_question(image, "Where is the scene?")
     activity_answer = ask_vqa_question(image, "What is the main activity?")
+    weather_answer = ask_vqa_question(image, "What is the weather or environment like?")
 
     # Normalize answers into natural phrases
     character = choose_character(caption, character_answer)
     setting = choose_setting(caption, setting_answer)
     activity = choose_activity(caption, activity_answer)
+    weather = choose_weather(caption, weather_answer, setting)
 
     text = (
         f"Character: {character}. "
         f"Setting: {setting}. "
+        f"Weather: {weather}. "
         f"Activity: {activity}. "
         f"Original image caption: {caption}."
     )
@@ -335,13 +371,15 @@ def parse_scenario(text: str) -> Dict[str, str]:
     fields = {
         "character": "someone",
         "setting": "in a nice place",
+        "weather": "pleasant",
         "activity": "enjoying the moment",
         "caption": "a simple scene",
     }
 
     patterns = {
         "character": r"Character:\s*(.*?)(?:\. Setting:|$)",
-        "setting": r"Setting:\s*(.*?)(?:\. Activity:|$)",
+        "setting": r"Setting:\s*(.*?)(?:\. Weather:|$)",
+        "weather": r"Weather:\s*(.*?)(?:\. Activity:|$)",
         "activity": r"Activity:\s*(.*?)(?:\. Original image caption:|$)",
         "caption": r"Original image caption:\s*(.*?)(?:\.|$)",
     }
@@ -359,6 +397,11 @@ def parse_scenario(text: str) -> Dict[str, str]:
 def build_story_prompt(text: str) -> str:
     """
     Build a clear image-grounded story prompt.
+
+    This prompt explicitly asks the model to create:
+    - beginning
+    - middle
+    - ending
     """
     details = parse_scenario(text)
 
@@ -368,12 +411,17 @@ Write one complete short story for children aged 3 to 10.
 Use these picture details naturally:
 Character: {details["character"]}
 Setting: {details["setting"]}
+Weather or environment: {details["weather"]}
 Activity: {details["activity"]}
 Original caption: {details["caption"]}
 
+Story structure:
+Beginning: introduce the character, setting, and weather.
+Middle: describe a small action during the activity.
+Ending: finish with a happy, simple ending.
+
 Story requirements:
-- 50 to 100 words
-- clear beginning, middle, and happy ending
+- 70 to 90 words
 - simple child-friendly English
 - directly related to the picture details
 - do not list the details
@@ -403,7 +451,8 @@ def generate_story_from_prompt(prompt: str) -> str:
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=140,
+            min_new_tokens=70,
+            max_new_tokens=150,
             num_beams=4,
             do_sample=False,
             repetition_penalty=1.15,
@@ -487,10 +536,27 @@ def limit_story_length(story: str, max_words: int = 100) -> str:
 
     if len(shortened_story.split()) < 40:
         shortened_story = " ".join(words[:max_words])
+
         if not shortened_story.endswith((".", "!", "?")):
             shortened_story += "."
 
     return shortened_story
+
+
+def count_words(text: str) -> int:
+    """
+    Count words in the story.
+    """
+    return len(text.split())
+
+
+def story_is_valid_length(story: str) -> bool:
+    """
+    Check whether the story meets the assignment requirement:
+    50 to 100 words.
+    """
+    word_count = count_words(story)
+    return 50 <= word_count <= 100
 
 
 def clean_story_text(story: str) -> str:
@@ -508,6 +574,99 @@ def clean_story_text(story: str) -> str:
     return story
 
 
+def make_length_repair_prompt(story: str, scenario_text: str) -> str:
+    """
+    Ask the model to rewrite the story into the correct word range.
+    """
+    details = parse_scenario(scenario_text)
+
+    prompt = f"""
+Rewrite the story below so it is 70 to 90 words long.
+
+Keep it child-friendly for ages 3 to 10.
+Keep a clear beginning, middle, and happy ending.
+Keep it directly related to these picture details:
+Character: {details["character"]}
+Setting: {details["setting"]}
+Weather or environment: {details["weather"]}
+Activity: {details["activity"]}
+Original caption: {details["caption"]}
+
+Do not mention the words "image", "caption", or "picture".
+Do not include scary, violent, romantic, or adult content.
+
+Story to rewrite:
+{story}
+
+Rewritten story:
+"""
+    return prompt.strip()
+
+
+def add_image_based_closing_sentence(story: str, scenario_text: str) -> str:
+    """
+    Add one final sentence if the story is still under 50 words.
+
+    This is not a backup story. It only extends the generated story
+    using the extracted image details.
+    """
+    details = parse_scenario(scenario_text)
+
+    closing_sentence = (
+        f"At the end, {details['character']} felt happy {details['setting']} "
+        f"because {details['activity']} made the day feel special."
+    )
+
+    story = story.strip()
+
+    if not story.endswith((".", "!", "?")):
+        story += "."
+
+    story = story + " " + closing_sentence
+    story = limit_story_length(story, max_words=100)
+
+    return story
+
+
+def repair_story_length(story: str, scenario_text: str, max_attempts: int = 2) -> str:
+    """
+    Repair the story length if it is outside the required 50-100 word range.
+    """
+    story = clean_story_text(story)
+
+    if story_is_valid_length(story):
+        return story
+
+    if count_words(story) > 100:
+        return limit_story_length(story, max_words=100)
+
+    for _ in range(max_attempts):
+        repair_prompt = make_length_repair_prompt(story, scenario_text)
+        repaired_story = generate_story_from_prompt(repair_prompt)
+        repaired_story = clean_story_text(repaired_story)
+
+        if story_is_valid_length(repaired_story):
+            return repaired_story
+
+        if count_words(repaired_story) > 100:
+            repaired_story = limit_story_length(repaired_story, max_words=100)
+
+            if story_is_valid_length(repaired_story):
+                return repaired_story
+
+        if count_words(repaired_story) > count_words(story):
+            story = repaired_story
+
+    while count_words(story) < 50:
+        story = add_image_based_closing_sentence(story, scenario_text)
+
+        if count_words(story) > 100:
+            story = limit_story_length(story, max_words=100)
+            break
+
+    return story
+
+
 def text2story(text: str) -> str:
     """
     Convert scenario text into a complete short story.
@@ -517,22 +676,19 @@ def text2story(text: str) -> str:
         def text2story(text):
             story_text = ...
             return story_text
+
+    The final story is checked and repaired to stay within 50-100 words.
     """
     prompt = build_story_prompt(text)
 
     raw_story = generate_story_from_prompt(prompt)
     story_text = clean_story_text(raw_story)
 
-    # If the first story is too short, ask the model one more time with a stronger prompt.
-    if len(story_text.split()) < 50:
-        retry_prompt = (
-            prompt
-            + "\n\nThe previous answer was too short. "
-            + "Now write a complete 70 to 90 word story with a beginning, middle, and happy ending."
-        )
-
-        raw_story = generate_story_from_prompt(retry_prompt)
-        story_text = clean_story_text(raw_story)
+    story_text = repair_story_length(
+        story=story_text,
+        scenario_text=text,
+        max_attempts=2,
+    )
 
     return story_text
 
