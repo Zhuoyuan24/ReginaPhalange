@@ -16,7 +16,6 @@ import io
 import re
 from pathlib import Path
 from typing import Dict
-from collections import Counter
 
 import streamlit as st
 from PIL import Image
@@ -24,7 +23,6 @@ import torch
 from gtts import gTTS
 
 from transformers import (
-    pipeline,
     BlipProcessor,
     BlipForConditionalGeneration,
     ViltProcessor,
@@ -38,15 +36,15 @@ from transformers import (
 # 2. MODEL SETTINGS
 # ----------------------------
 
-# Professor-provided image captioning model
+# Image captioning model suggested by professor
 IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# Extra image-understanding models
+# Extra image understanding model
+# Used only to extract character, setting, and activity
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
-OBJECT_DETECTION_MODEL = "facebook/detr-resnet-50"
 
-# Improved story model
-# FLAN-T5 is better at following instructions than the previous story model.
+# Better story generation model
+# FLAN-T5 follows instructions better than the earlier story generator model
 STORY_MODEL = "google/flan-t5-base"
 
 
@@ -63,24 +61,13 @@ def get_torch_device() -> torch.device:
     return torch.device("cpu")
 
 
-def get_pipeline_device() -> int:
-    """
-    Hugging Face pipeline uses:
-    device = 0  for GPU
-    device = -1 for CPU
-    """
-    if torch.cuda.is_available():
-        return 0
-    return -1
-
-
-@st.cache_resource(show_spinner="Loading BLIP image captioning model...")
+@st.cache_resource(show_spinner="Loading image captioning model...")
 def load_image_captioning_model():
     """
-    Load the BLIP image captioning model directly.
+    Load BLIP image captioning model.
 
-    We do not use pipeline("image-to-text") because some current
-    Transformers environments no longer recognize that task name.
+    This replaces pipeline("image-to-text") because some Streamlit Cloud
+    environments no longer recognize the image-to-text pipeline task name.
     """
     device = get_torch_device()
 
@@ -96,7 +83,12 @@ def load_image_captioning_model():
 @st.cache_resource(show_spinner="Loading visual question answering model...")
 def load_vqa_model():
     """
-    Load the visual question answering model.
+    Load visual question answering model.
+
+    This model helps extract simple image details:
+    - character
+    - setting
+    - activity
     """
     device = get_torch_device()
 
@@ -109,31 +101,10 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading object detection model...")
-def load_object_detection_pipeline():
-    """
-    Load the object detection model.
-
-    Note:
-    facebook/detr-resnet-50 requires timm in requirements.txt.
-    """
-    object_detection_model = pipeline(
-        task="object-detection",
-        model=OBJECT_DETECTION_MODEL,
-        device=get_pipeline_device(),
-    )
-
-    return object_detection_model
-
-
-@st.cache_resource(show_spinner="Loading FLAN-T5 story model...")
+@st.cache_resource(show_spinner="Loading story generation model...")
 def load_story_model():
     """
-    Load FLAN-T5 for instruction-following story generation.
-
-    This uses AutoTokenizer and AutoModelForSeq2SeqLM directly instead of
-    pipeline("text2text-generation"), because some environments may not list
-    text2text-generation as an available pipeline task.
+    Load FLAN-T5 model for story generation.
     """
     device = get_torch_device()
 
@@ -146,25 +117,9 @@ def load_story_model():
     return tokenizer, model, device
 
 
-def clean_short_answer(answer: str, fallback: str = "unknown") -> str:
-    """
-    Clean short VQA answers.
-    """
-    if answer is None:
-        return fallback
-
-    answer = str(answer).strip().lower()
-
-    bad_answers = ["", "unknown", "none", "no", "nothing", "n/a"]
-    if answer in bad_answers:
-        return fallback
-
-    return answer
-
-
 def generate_basic_caption(image: Image.Image) -> str:
     """
-    Generate a basic caption using the BLIP model.
+    Generate the original image caption using BLIP.
     """
     processor, model, device = load_image_captioning_model()
 
@@ -181,9 +136,24 @@ def generate_basic_caption(image: Image.Image) -> str:
     return caption.strip()
 
 
+def clean_short_answer(answer: str, fallback: str = "unknown") -> str:
+    """
+    Clean short VQA model answers.
+    """
+    if answer is None:
+        return fallback
+
+    answer = str(answer).strip().lower()
+
+    if answer in ["", "none", "unknown", "nothing", "n/a"]:
+        return fallback
+
+    return answer
+
+
 def ask_vqa_question(image: Image.Image, question: str) -> str:
     """
-    Ask a visual question about the image.
+    Ask a visual question about the uploaded image.
     """
     try:
         processor, model, device = load_vqa_model()
@@ -208,96 +178,11 @@ def ask_vqa_question(image: Image.Image, question: str) -> str:
         return "unknown"
 
 
-def add_article(noun: str) -> str:
+def choose_character(caption: str, character_answer: str) -> str:
     """
-    Add a simple article to object labels.
-
-    Example:
-        ball -> a ball
-        umbrella -> an umbrella
+    Choose a natural character phrase from the caption and VQA answer.
     """
-    noun = noun.strip().lower()
-
-    if not noun:
-        return ""
-
-    if noun.startswith(("a ", "an ", "the ")):
-        return noun
-
-    if noun[0] in ["a", "e", "i", "o", "u"]:
-        return f"an {noun}"
-
-    return f"a {noun}"
-
-
-def format_object_list(labels) -> str:
-    """
-    Format object labels naturally without counts.
-
-    Example:
-        ["ball", "skateboard"] -> "a ball and a skateboard"
-    """
-    if not labels:
-        return "none"
-
-    unique_labels = []
-    for label in labels:
-        if label not in unique_labels:
-            unique_labels.append(label)
-
-    unique_labels = unique_labels[:3]
-    article_labels = [add_article(label) for label in unique_labels]
-
-    if len(article_labels) == 1:
-        return article_labels[0]
-
-    if len(article_labels) == 2:
-        return f"{article_labels[0]} and {article_labels[1]}"
-
-    return f"{article_labels[0]}, {article_labels[1]}, and {article_labels[2]}"
-
-
-def detect_story_objects(image: Image.Image, score_threshold: float = 0.80) -> str:
-    """
-    Detect useful story objects.
-
-    This version avoids listing people counts because it sounds unnatural
-    in the story.
-    """
-    try:
-        object_detector = load_object_detection_pipeline()
-        detections = object_detector(image)
-
-        object_labels = []
-
-        for item in detections:
-            label = item.get("label", "").lower().strip()
-            score = item.get("score", 0)
-
-            if not label or score < score_threshold:
-                continue
-
-            # Avoid unnatural object lines like "1 person"
-            if label in ["person", "people"]:
-                continue
-
-            # Make COCO label sound more natural
-            if label == "sports ball":
-                label = "ball"
-
-            object_labels.append(label)
-
-        return format_object_list(object_labels)
-
-    except Exception:
-        return "none"
-
-
-def choose_character(caption: str, people: str, main_subject: str) -> str:
-    """
-    Choose a natural character phrase from the image information.
-    """
-    combined = f"{caption} {people} {main_subject}".lower()
+    combined = f"{caption} {character_answer}".lower()
 
     if "children" in combined or "kids" in combined:
         return "children"
@@ -311,7 +196,7 @@ def choose_character(caption: str, people: str, main_subject: str) -> str:
     if "child" in combined:
         return "a child"
 
-    if "group" in combined or "people" in combined:
+    if "people" in combined or "group" in combined:
         return "a group of people"
 
     if "person" in combined:
@@ -320,11 +205,11 @@ def choose_character(caption: str, people: str, main_subject: str) -> str:
     return "someone"
 
 
-def choose_setting(caption: str, place: str) -> str:
+def choose_setting(caption: str, setting_answer: str) -> str:
     """
-    Convert location information into a natural setting phrase.
+    Convert setting information into natural English.
     """
-    combined = f"{caption} {place}".lower()
+    combined = f"{caption} {setting_answer}".lower()
 
     if "gym" in combined:
         return "in a gym"
@@ -335,11 +220,17 @@ def choose_setting(caption: str, place: str) -> str:
     if "snow" in combined or "mountain" in combined:
         return "on a snowy mountain"
 
-    if "street" in combined:
-        return "on a street"
+    if "ocean" in combined or "sea" in combined:
+        return "by the ocean"
+
+    if "lake" in combined:
+        return "by a lake"
 
     if "beach" in combined:
         return "at a beach"
+
+    if "street" in combined or "road" in combined:
+        return "on a street"
 
     if "room" in combined or "inside" in combined or "indoor" in combined:
         return "inside a room"
@@ -347,17 +238,19 @@ def choose_setting(caption: str, place: str) -> str:
     if "outside" in combined or "outdoor" in combined:
         return "outside"
 
-    if place not in ["unknown", "none", ""]:
-        return f"in {place}"
+    if setting_answer not in ["unknown", "none", ""]:
+        if setting_answer.startswith(("in ", "on ", "at ", "by ")):
+            return setting_answer
+        return f"in {setting_answer}"
 
     return "in a nice place"
 
 
-def choose_activity(caption: str, activity: str) -> str:
+def choose_activity(caption: str, activity_answer: str) -> str:
     """
-    Convert activity information into a natural action phrase.
+    Convert activity information into natural English.
     """
-    combined = f"{caption} {activity}".lower()
+    combined = f"{caption} {activity_answer}".lower()
 
     if "basketball" in combined:
         return "playing basketball"
@@ -368,22 +261,28 @@ def choose_activity(caption: str, activity: str) -> str:
     if "ski" in combined:
         return "skiing"
 
-    if "walk" in combined:
-        return "walking together"
+    if "sitting on a rock" in combined and ("ocean" in combined or "sea" in combined):
+        return "sitting on a rock and looking at the ocean"
 
-    if "run" in combined:
-        return "running around"
+    if "sitting" in combined:
+        return "sitting quietly"
 
-    if "play" in combined:
+    if "walking" in combined or "walk" in combined:
+        return "walking"
+
+    if "running" in combined or "run" in combined:
+        return "running"
+
+    if "playing" in combined or "play" in combined:
         return "playing"
 
     if "laying in the snow" in combined or "lying in the snow" in combined:
         return "resting in the snow"
 
-    if activity not in ["unknown", "none", ""]:
-        if activity.endswith("ing"):
-            return activity
-        return f"enjoying {activity}"
+    if activity_answer not in ["unknown", "none", ""]:
+        if activity_answer.endswith("ing"):
+            return activity_answer
+        return f"enjoying {activity_answer}"
 
     return "enjoying the moment"
 
@@ -395,65 +294,55 @@ def img2text(url: str) -> str:
     This follows the professor's required function style:
 
         def img2text(url):
-            ...
+            text = ...
             return text
 
-    Improvement:
-    The scenario is now natural and story-friendly.
-    It no longer lists object counts or unreliable mood labels.
+    This function extracts only the useful story information:
+    - Character
+    - Setting
+    - Activity
+    - Original image caption
     """
     image = Image.open(url).convert("RGB")
 
-    # 1. Basic caption
+    # Basic image caption
     caption = generate_basic_caption(image)
 
-    # 2. Extra visual details
-    main_subject = ask_vqa_question(image, "What is the main subject of the image?")
-    people = ask_vqa_question(image, "Who is in the picture?")
-    place = ask_vqa_question(image, "Where is the scene?")
-    activity = ask_vqa_question(image, "What is happening in the image?")
+    # Ask a few visual questions
+    character_answer = ask_vqa_question(image, "Who is the main character in the image?")
+    setting_answer = ask_vqa_question(image, "Where is the scene?")
+    activity_answer = ask_vqa_question(image, "What is the main activity?")
 
-    # 3. Useful objects, without people counts
-    objects = detect_story_objects(image)
-
-    # 4. Normalize into natural story facts
-    character = choose_character(caption, people, main_subject)
-    setting = choose_setting(caption, place)
-    action = choose_activity(caption, activity)
-
-    if objects == "none":
-        object_sentence = "There are no extra important objects needed for the story."
-    else:
-        object_sentence = f"An important visual detail is {objects}."
+    # Normalize answers into natural phrases
+    character = choose_character(caption, character_answer)
+    setting = choose_setting(caption, setting_answer)
+    activity = choose_activity(caption, activity_answer)
 
     text = (
         f"Character: {character}. "
         f"Setting: {setting}. "
-        f"Activity: {action}. "
-        f"{object_sentence} "
+        f"Activity: {activity}. "
         f"Original image caption: {caption}."
     )
 
     return text
 
 
-def parse_scenario_details(text: str) -> Dict[str, str]:
+def parse_scenario(text: str) -> Dict[str, str]:
     """
-    Parse the scenario text into fields.
+    Parse scenario text into fields for the story prompt.
     """
     fields = {
         "character": "someone",
         "setting": "in a nice place",
         "activity": "enjoying the moment",
-        "objects": "none",
         "caption": "a simple scene",
     }
 
     patterns = {
         "character": r"Character:\s*(.*?)(?:\. Setting:|$)",
         "setting": r"Setting:\s*(.*?)(?:\. Activity:|$)",
-        "activity": r"Activity:\s*(.*?)(?:\. An important visual detail is|\. There are no extra|$)",
-        "objects": r"An important visual detail is\s*(.*?)(?:\. Original image caption:|$)",
+        "activity": r"Activity:\s*(.*?)(?:\. Original image caption:|$)",
         "caption": r"Original image caption:\s*(.*?)(?:\.|$)",
     }
 
@@ -467,134 +356,126 @@ def parse_scenario_details(text: str) -> Dict[str, str]:
     return fields
 
 
-def get_character_grammar(character: str) -> Dict[str, str]:
-    """
-    Return grammar settings for the character.
-
-    This prevents errors like:
-        "man were"
-        "woman were"
-    """
-    character = character.strip().lower()
-
-    if character in ["children", "people", "a group of people"]:
-        return {
-            "subject": character,
-            "be": "were",
-            "pronoun": "they",
-            "pronoun_cap": "They",
-        }
-
-    if character in ["a man", "man"]:
-        return {
-            "subject": "a man",
-            "be": "was",
-            "pronoun": "he",
-            "pronoun_cap": "He",
-        }
-
-    if character in ["a woman", "woman"]:
-        return {
-            "subject": "a woman",
-            "be": "was",
-            "pronoun": "she",
-            "pronoun_cap": "She",
-        }
-
-    if character in ["a child", "child"]:
-        return {
-            "subject": "a child",
-            "be": "was",
-            "pronoun": "the child",
-            "pronoun_cap": "The child",
-        }
-
-    return {
-        "subject": character,
-        "be": "was",
-        "pronoun": "they",
-        "pronoun_cap": "They",
-    }
-
-
 def build_story_prompt(text: str) -> str:
     """
-    Build a strict image-grounded prompt for FLAN-T5.
+    Build a clear image-grounded story prompt.
     """
-    details = parse_scenario_details(text)
+    details = parse_scenario(text)
 
     prompt = f"""
 Write one complete short story for children aged 3 to 10.
 
-Use these image facts naturally. Do not list the facts.
-
-Image facts:
+Use these picture details naturally:
 Character: {details["character"]}
 Setting: {details["setting"]}
 Activity: {details["activity"]}
-Visual detail: {details["objects"]}
-Caption: {details["caption"]}
+Original caption: {details["caption"]}
 
-Story rules:
-- 50 to 90 words
+Story requirements:
+- 50 to 100 words
 - clear beginning, middle, and happy ending
 - simple child-friendly English
-- directly related to the image facts
+- directly related to the picture details
+- do not list the details
+- do not mention the words "image", "caption", or "picture"
 - no scary, violent, romantic, or adult content
-- do not mention "image", "caption", or "visual detail"
 
-Story:
+Write only the story:
 """
     return prompt.strip()
 
 
-def extract_story_only(raw_story: str, prompt: str) -> str:
+def generate_story_from_prompt(prompt: str) -> str:
     """
-    Clean raw model output.
+    Generate a story using FLAN-T5.
     """
-    story = raw_story.replace(prompt, "").strip()
+    tokenizer, model, device = load_story_model()
 
-    if "Story:" in story:
-        story = story.split("Story:")[-1].strip()
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    )
 
-    unwanted_labels = [
-        "Image facts:",
-        "Character:",
-        "Setting:",
-        "Activity:",
-        "Visual detail:",
-        "Caption:",
-        "Beginning:",
-        "Middle:",
-        "Ending:",
-        "Answer:",
-        "Output:",
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=140,
+            num_beams=4,
+            do_sample=False,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
+
+    story = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return story.strip()
+
+
+def remove_sensitive_sentences(story: str) -> str:
+    """
+    Remove sentences containing content unsuitable for children aged 3-10.
+    """
+    sensitive_words = [
+        "wife",
+        "husband",
+        "fiancé",
+        "fiance",
+        "romantic",
+        "blood",
+        "kill",
+        "dead",
+        "death",
+        "gun",
+        "war",
+        "adult",
+        "drunk",
+        "wine",
     ]
 
-    for label in unwanted_labels:
-        story = story.replace(label, "")
+    sentences = re.findall(r"[^.!?]+[.!?]", story)
 
-    story = re.sub(r"\s+", " ", story).strip()
+    if not sentences:
+        sentences = [story]
 
-    return story
+    safe_sentences = []
+
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        has_sensitive_word = False
+
+        for word in sensitive_words:
+            if word in sentence_lower:
+                has_sensitive_word = True
+                break
+
+        if not has_sensitive_word:
+            safe_sentences.append(sentence.strip())
+
+    cleaned_story = " ".join(safe_sentences)
+    cleaned_story = re.sub(r"\s+", " ", cleaned_story).strip()
+
+    return cleaned_story
 
 
 def keep_complete_sentences(story: str) -> str:
     """
-    Keep only complete sentences ending with punctuation.
+    Keep complete sentences only.
     """
-    sentence_matches = re.findall(r"[^.!?]+[.!?]", story)
+    sentences = re.findall(r"[^.!?]+[.!?]", story)
 
-    if not sentence_matches:
+    if not sentences:
         return story.strip()
 
-    complete_story = " ".join(sentence.strip() for sentence in sentence_matches)
-    return complete_story.strip()
+    return " ".join(sentence.strip() for sentence in sentences)
 
 
 def limit_story_length(story: str, max_words: int = 100) -> str:
     """
-    Limit story length while keeping it readable.
+    Limit story to the assignment word range upper limit.
     """
     words = story.split()
 
@@ -612,172 +493,57 @@ def limit_story_length(story: str, max_words: int = 100) -> str:
     return shortened_story
 
 
-def story_has_bad_content(story: str) -> bool:
+def clean_story_text(story: str) -> str:
     """
-    Check if the story contains unsuitable content.
+    Clean the generated story.
     """
-    bad_words = [
-        "wife",
-        "fiancé",
-        "fiance",
-        "husband",
-        "romantic",
-        "blood",
-        "kill",
-        "dead",
-        "death",
-        "gun",
-        "war",
-        "adult",
-        "drunk",
-        "wine",
-    ]
+    story = story.replace("Story:", "").strip()
+    story = story.replace("Write only the story:", "").strip()
+    story = re.sub(r"\s+", " ", story).strip()
 
-    story_lower = story.lower()
-
-    for word in bad_words:
-        if word in story_lower:
-            return True
-
-    return False
-
-
-def story_is_too_generic(story: str, text: str) -> bool:
-    """
-    Check whether the story uses enough image-specific details.
-    """
-    details = parse_scenario_details(text)
-    story_lower = story.lower()
-
-    keywords = []
-
-    for field in ["character", "setting", "activity", "objects"]:
-        value = details.get(field, "")
-        words = re.findall(r"[a-zA-Z]+", value.lower())
-
-        for word in words:
-            if len(word) >= 4 and word not in ["with", "there", "important", "visual", "detail"]:
-                keywords.append(word)
-
-    if not keywords:
-        return False
-
-    matched = 0
-    for keyword in set(keywords):
-        if keyword in story_lower:
-            matched += 1
-
-    return matched < 2
-
-
-def make_simple_backup_story(text: str) -> str:
-    """
-    Create a reliable, image-specific backup story.
-
-    This is only used if the model output is too short, unsafe, or unrelated.
-    """
-    details = parse_scenario_details(text)
-    grammar = get_character_grammar(details["character"])
-
-    subject = grammar["subject"]
-    be = grammar["be"]
-    pronoun = grammar["pronoun"]
-    pronoun_cap = grammar["pronoun_cap"]
-
-    setting = details["setting"]
-    activity = details["activity"]
-    objects = details["objects"]
-
-    if objects != "none":
-        object_sentence = f"{pronoun_cap} noticed {objects} nearby."
-    else:
-        object_sentence = f"{pronoun_cap} looked around carefully."
-
-    story = (
-        f"One day, {subject} {be} {setting}. "
-        f"{pronoun_cap} {be} {activity}, and the moment felt like a small adventure. "
-        f"{object_sentence} "
-        f"{pronoun_cap} tried carefully, smiled, and kept going. "
-        f"Soon, the day felt bright and special. "
-        f"By the end, {pronoun} felt proud because every simple moment can become a happy story."
-    )
-
-    return limit_story_length(story, max_words=100)
-
-
-def clean_story_text(raw_story: str, prompt: str, text: str) -> str:
-    """
-    Clean and validate the generated story.
-    """
-    story = extract_story_only(raw_story, prompt)
+    story = remove_sensitive_sentences(story)
     story = keep_complete_sentences(story)
     story = limit_story_length(story, max_words=100)
-
-    word_count = len(story.split())
-
-    if word_count < 50:
-        story = make_simple_backup_story(text)
-
-    if story_has_bad_content(story):
-        story = make_simple_backup_story(text)
-
-    if story_is_too_generic(story, text):
-        story = make_simple_backup_story(text)
 
     return story
 
 
 def text2story(text: str) -> str:
     """
-    Convert image scenario text into a complete short story.
+    Convert scenario text into a complete short story.
 
     This follows the professor's required function style:
 
         def text2story(text):
-            story_text = ""
+            story_text = ...
             return story_text
     """
-    tokenizer, model, device = load_story_model()
     prompt = build_story_prompt(text)
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-    )
+    raw_story = generate_story_from_prompt(prompt)
+    story_text = clean_story_text(raw_story)
 
-    inputs = {key: value.to(device) for key, value in inputs.items()}
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=130,
-            num_beams=4,
-            do_sample=False,
-            repetition_penalty=1.15,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
+    # If the first story is too short, ask the model one more time with a stronger prompt.
+    if len(story_text.split()) < 50:
+        retry_prompt = (
+            prompt
+            + "\n\nThe previous answer was too short. "
+            + "Now write a complete 70 to 90 word story with a beginning, middle, and happy ending."
         )
 
-    raw_story = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-    story_text = clean_story_text(
-        raw_story=raw_story,
-        prompt=prompt,
-        text=text,
-    )
+        raw_story = generate_story_from_prompt(retry_prompt)
+        story_text = clean_story_text(raw_story)
 
     return story_text
 
 
 def prepare_text_for_audio(story_text: str) -> str:
     """
-    Prepare text for smoother TTS reading.
+    Prepare text for smoother text-to-speech.
     """
     story_text = re.sub(r"\s+", " ", story_text).strip()
 
-    # Add small spacing after punctuation to help speech rhythm.
+    # Extra spaces after punctuation help the audio pause more naturally.
     story_text = story_text.replace(". ", ".  ")
     story_text = story_text.replace("! ", "!  ")
     story_text = story_text.replace("? ", "?  ")
@@ -792,12 +558,13 @@ def text2audio(story_text: str) -> io.BytesIO:
     This follows the professor's required function style:
 
         def text2audio(story_text):
-            audio_data = ""
+            audio_data = ...
             return audio_data
     """
     audio_text = prepare_text_for_audio(story_text)
 
     audio_data = io.BytesIO()
+
     tts = gTTS(
         text=audio_text,
         lang="en",
@@ -812,7 +579,7 @@ def text2audio(story_text: str) -> io.BytesIO:
 
 def save_uploaded_image(uploaded_file) -> str:
     """
-    Save uploaded image locally, following the professor's example.
+    Save uploaded image locally, following the professor's template.
     """
     suffix = Path(uploaded_file.name).suffix.lower()
 
@@ -829,28 +596,6 @@ def save_uploaded_image(uploaded_file) -> str:
     return image_path
 
 
-def show_sidebar():
-    """
-    Show app explanation in the sidebar.
-    """
-    st.sidebar.title("How this app works")
-    st.sidebar.write(
-        "1. Upload an image.\n"
-        "2. The app extracts image details.\n"
-        "3. The app creates a short story.\n"
-        "4. The app converts the story into audio."
-    )
-
-    st.sidebar.divider()
-
-    st.sidebar.write("Models used:")
-    st.sidebar.caption("Image caption: Salesforce/blip-image-captioning-base")
-    st.sidebar.caption("Visual Q&A: dandelin/vilt-b32-finetuned-vqa")
-    st.sidebar.caption("Object detection: facebook/detr-resnet-50")
-    st.sidebar.caption("Story: google/flan-t5-base")
-    st.sidebar.caption("Audio: gTTS")
-
-
 # ----------------------------
 # 4. MAIN PART
 # ----------------------------
@@ -859,7 +604,7 @@ def main():
     """
     Main Streamlit application.
 
-    Execution flow:
+    Flow:
     upload image -> show image -> img2text -> text2story -> text2audio
     """
     st.set_page_config(
@@ -868,12 +613,8 @@ def main():
         layout="centered",
     )
 
-    show_sidebar()
-
-    st.title("🦜 Your Image to Audio Story")
-    st.write("Upload an image and turn it into a short audio story for kids.")
-
-    st.divider()
+    st.header("Turn Your Image to Audio Story")
+    st.write("Upload an image and the app will generate a short child-friendly story with audio.")
 
     uploaded_file = st.file_uploader(
         "Select an Image...",
@@ -884,37 +625,30 @@ def main():
     if uploaded_file is not None:
         image_path = save_uploaded_image(uploaded_file)
 
-        st.subheader("Uploaded Image")
-        st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+        st.image(
+            uploaded_file,
+            caption="Uploaded Image",
+            use_container_width=True,
+        )
 
-        if st.button("Generate Story and Audio", type="primary"):
+        if st.button("Generate Story and Audio"):
             try:
                 # Stage 1: Image to text
                 st.text("Processing img2text...")
-                with st.spinner("Understanding the image..."):
-                    scenario = img2text(image_path)
-
-                st.subheader("1. Generated Scenario")
-                st.write(scenario)
+                scenario = img2text(image_path)
+                st.write(f"**Scenario:** {scenario}")
 
                 # Stage 2: Text to story
                 st.text("Generating a story...")
-                with st.spinner("Writing a short child-friendly story..."):
-                    story = text2story(scenario)
-
-                st.subheader("2. Generated Story")
-                st.write(story)
+                story = text2story(scenario)
+                st.write(f"**Story:** {story}")
                 st.caption(f"Word count: {len(story.split())} words")
 
-                # Stage 3: Story to audio
+                # Stage 3: Text to audio
                 st.text("Generating audio data...")
-                with st.spinner("Creating audio..."):
-                    audio_data = text2audio(story)
+                audio_data = text2audio(story)
 
-                st.subheader("3. Story Audio")
                 st.audio(audio_data, format="audio/mp3")
-
-                st.success("Done! The image has been converted into a story and audio.")
 
             except Exception as error:
                 st.error("Something went wrong while generating the story or audio.")
