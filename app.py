@@ -28,7 +28,7 @@ from transformers import (
     ViltProcessor,
     ViltForQuestionAnswering,
     AutoTokenizer,
-    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
 )
 
 
@@ -43,9 +43,8 @@ IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 # Used to extract character, setting, activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
-# Story generation model
-# FLAN-T5 Base is lighter and more stable on Streamlit Cloud than FLAN-T5 Large.
-STORY_MODEL = "google/flan-t5-base"
+# Small instruction-following model for better story generation
+STORY_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 
 # ----------------------------
@@ -102,18 +101,25 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading FLAN-T5 Base story model...")
+@st.cache_resource(show_spinner="Loading story generation model...")
 def load_story_model():
     """
-    Load FLAN-T5 Base for instruction-following story generation.
+    Load a small instruction-following language model for story generation.
 
-    FLAN-T5 is a sequence-to-sequence model, so we use:
-    AutoTokenizer + AutoModelForSeq2SeqLM.
+    This is more suitable than FLAN-T5-base for generating a complete,
+    natural story with beginning, middle, and ending.
     """
     device = get_torch_device()
 
     tokenizer = AutoTokenizer.from_pretrained(STORY_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(STORY_MODEL)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        STORY_MODEL,
+        torch_dtype=torch.float32,
+    )
 
     model.to(device)
     model.eval()
@@ -395,54 +401,77 @@ def parse_scenario(text: str) -> Dict[str, str]:
 
 def build_story_prompt(text: str) -> str:
     """
-    Build a clear image-grounded story prompt.
-
-    This prompt explicitly asks the model to create:
-    - beginning
-    - middle
-    - ending
+    Build a strict prompt for a complete child-friendly story.
     """
     details = parse_scenario(text)
 
     prompt = f"""
-Write one complete short story for children aged 3 to 10.
+You are a children's story writer.
 
-Use these picture details naturally:
+Write ONE complete short story for children aged 3 to 10.
+
+Use these scene details naturally:
 Character: {details["character"]}
 Setting: {details["setting"]}
 Weather or environment: {details["weather"]}
 Activity: {details["activity"]}
-Original caption: {details["caption"]}
+Original scene: {details["caption"]}
 
-Story structure:
-Beginning: introduce the character, setting, and weather.
-Middle: describe a small action during the activity.
-Ending: finish with a happy, simple ending.
+The story must have:
+1. Beginning: introduce the character and place.
+2. Middle: something small happens during the activity.
+3. Ending: the character feels happy, proud, calm, or excited.
 
-Story requirements:
-- 70 to 90 words
-- simple child-friendly English
-- directly related to the picture details
-- do not list the details
-- do not mention the words "image", "caption", or "picture"
-- no scary, violent, romantic, or adult content
+Rules:
+- 50 to 100 words.
+- Use simple child-friendly English.
+- Stay directly related to the scene details.
+- Do not mention "image", "caption", "picture", "prompt", or "details".
+- Do not include phone numbers, emails, websites, comments, or contact information.
+- Do not include scary, violent, romantic, or adult content.
+- Write only the story, no explanation.
 
-Write only the story:
+Story:
 """
     return prompt.strip()
 
 
+def format_prompt_for_chat_model(tokenizer, prompt: str) -> str:
+    """
+    Format prompt for an instruction/chat model if chat template is available.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    ]
+
+    try:
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return formatted_prompt
+
+    except Exception:
+        return prompt
+
+
 def generate_story_from_prompt(prompt: str) -> str:
     """
-    Generate a story using FLAN-T5 Base.
+    Generate a story using the instruction-following model.
     """
     tokenizer, model, device = load_story_model()
 
+    formatted_prompt = format_prompt_for_chat_model(tokenizer, prompt)
+
     inputs = tokenizer(
-        prompt,
+        formatted_prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=768,
     )
 
     inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -450,16 +479,18 @@ def generate_story_from_prompt(prompt: str) -> str:
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            min_new_tokens=70,
-            max_new_tokens=150,
-            num_beams=4,
-            do_sample=False,
-            repetition_penalty=1.15,
+            max_new_tokens=140,
+            do_sample=True,
+            temperature=0.65,
+            top_p=0.90,
+            repetition_penalty=1.18,
             no_repeat_ngram_size=3,
-            early_stopping=True,
+            pad_token_id=tokenizer.eos_token_id,
         )
 
-    story = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
+    story = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
     return story.strip()
 
 
@@ -484,6 +515,16 @@ def remove_sensitive_sentences(story: str) -> str:
         "wine",
         "sex",
         "naked",
+        "contact",
+        "phone",
+        "email",
+        "website",
+        "comment",
+        "question",
+        "call me",
+        "@",
+        "http",
+        "www",
     ]
 
     sentences = re.findall(r"[^.!?]+[.!?]", story)
@@ -598,15 +639,16 @@ Rewrite the story below so it is 70 to 90 words long.
 
 Keep it child-friendly for ages 3 to 10.
 Keep a clear beginning, middle, and happy ending.
-Keep it directly related to these picture details:
+Keep it directly related to these scene details:
 Character: {details["character"]}
 Setting: {details["setting"]}
 Weather or environment: {details["weather"]}
 Activity: {details["activity"]}
-Original caption: {details["caption"]}
+Original scene: {details["caption"]}
 
-Do not mention the words "image", "caption", or "picture".
+Do not mention the words "image", "caption", "picture", "prompt", or "details".
 Do not include scary, violent, romantic, or adult content.
+Do not include phone numbers, emails, websites, comments, or contact information.
 
 Story to rewrite:
 {story}
@@ -638,7 +680,7 @@ def add_image_based_closing_sentence(story: str, scenario_text: str) -> str:
     return story
 
 
-def repair_story_length(story: str, scenario_text: str, max_attempts: int = 2) -> str:
+def repair_story_length(story: str, scenario_text: str, max_attempts: int = 1) -> str:
     """
     Repair the story length if it is outside the required 50-100 word range.
     """
@@ -692,10 +734,16 @@ def text2story(text: str) -> str:
     raw_story = generate_story_from_prompt(prompt)
     story_text = clean_story_text(raw_story)
 
+    # If the first story is too short or too long, generate one more version.
+    # The separate bad-ending detector was intentionally removed.
+    if not story_is_valid_length(story_text):
+        raw_story = generate_story_from_prompt(prompt)
+        story_text = clean_story_text(raw_story)
+
     story_text = repair_story_length(
         story=story_text,
         scenario_text=text,
-        max_attempts=2,
+        max_attempts=1,
     )
 
     return story_text
