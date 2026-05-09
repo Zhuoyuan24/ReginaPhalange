@@ -44,8 +44,8 @@ IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
 # Story generation model
-# FLAN-T5 Large is stronger than FLAN-T5 Base and better at following instructions.
-STORY_MODEL = "google/flan-t5-large"
+# FLAN-T5 Base is lighter and more stable on Streamlit Cloud than FLAN-T5 Large.
+STORY_MODEL = "google/flan-t5-base"
 
 
 # ----------------------------
@@ -102,10 +102,10 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading FLAN-T5 Large story model...")
+@st.cache_resource(show_spinner="Loading FLAN-T5 Base story model...")
 def load_story_model():
     """
-    Load FLAN-T5 Large for instruction-following story generation.
+    Load FLAN-T5 Base for instruction-following story generation.
 
     FLAN-T5 is a sequence-to-sequence model, so we use:
     AutoTokenizer + AutoModelForSeq2SeqLM.
@@ -434,7 +434,7 @@ Write only the story:
 
 def generate_story_from_prompt(prompt: str) -> str:
     """
-    Generate a story using FLAN-T5 Large.
+    Generate a story using FLAN-T5 Base.
     """
     tokenizer, model, device = load_story_model()
 
