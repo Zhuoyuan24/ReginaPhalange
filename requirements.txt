@@ -1,5 +1,5 @@
 streamlit
-transformers>=4.51.0
+transformers
 torch
 Pillow
 sentencepiece
