@@ -1,4 +1,10 @@
 streamlit
-transformers<5.0.0
+transformers
 torch
 Pillow
+sentencepiece
+accelerate
+scipy
+protobuf
+uroman
+timm
