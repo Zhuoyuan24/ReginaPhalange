@@ -28,7 +28,7 @@ from transformers import (
     ViltProcessor,
     ViltForQuestionAnswering,
     AutoTokenizer,
-    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
 )
 
 
@@ -43,9 +43,20 @@ IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 # Used to extract character, setting, activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
-# Better story generation model
-# FLAN-T5 follows instructions better than the earlier story generator model.
-STORY_MODEL = "google/flan-t5-base"
+# Qwen3 story generation model
+# Qwen3-0.6B is the smallest Qwen3 model and is more suitable for Streamlit Cloud.
+STORY_MODEL = "Qwen/Qwen3-0.6B"
+
+# Qwen3 citation:
+# @misc{qwen3technicalreport,
+#       title={Qwen3 Technical Report},
+#       author={Qwen Team},
+#       year={2025},
+#       eprint={2505.09388},
+#       archivePrefix={arXiv},
+#       primaryClass={cs.CL},
+#       url={https://arxiv.org/abs/2505.09388},
+# }
 
 
 # ----------------------------
@@ -66,9 +77,8 @@ def load_image_captioning_model():
     """
     Load BLIP image captioning model.
 
-    We use BlipProcessor and BlipForConditionalGeneration directly
-    because some Streamlit Cloud environments may not recognize
-    pipeline("image-to-text").
+    We use BlipProcessor and BlipForConditionalGeneration directly because
+    some Streamlit Cloud environments may not recognize pipeline("image-to-text").
     """
     device = get_torch_device()
 
@@ -103,15 +113,28 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading story generation model...")
+@st.cache_resource(show_spinner="Loading Qwen3 story generation model...")
 def load_story_model():
     """
-    Load FLAN-T5 model for instruction-following story generation.
+    Load Qwen3 for instruction-following story generation.
+
+    Qwen3 is a causal language model, so we use:
+    AutoTokenizer + AutoModelForCausalLM.
     """
     device = get_torch_device()
 
     tokenizer = AutoTokenizer.from_pretrained(STORY_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(STORY_MODEL)
+
+    if torch.cuda.is_available():
+        model = AutoModelForCausalLM.from_pretrained(
+            STORY_MODEL,
+            torch_dtype=torch.bfloat16,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            STORY_MODEL,
+            torch_dtype=torch.float32,
+        )
 
     model.to(device)
     model.eval()
@@ -433,17 +456,55 @@ Write only the story:
     return prompt.strip()
 
 
+def remove_qwen_thinking_text(text: str) -> str:
+    """
+    Remove Qwen thinking blocks if they appear.
+
+    We set enable_thinking=False, but this cleaning step is included for safety.
+    """
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    if "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+
+    return text
+
+
 def generate_story_from_prompt(prompt: str) -> str:
     """
-    Generate a story using FLAN-T5.
+    Generate a story using Qwen3.
+
+    Qwen3 uses a chat template. We disable thinking mode for faster,
+    direct story generation.
     """
     tokenizer, model, device = load_story_model()
 
+    messages = [
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    ]
+
+    try:
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     inputs = tokenizer(
-        prompt,
+        [formatted_prompt],
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=1024,
     )
 
     inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -451,16 +512,20 @@ def generate_story_from_prompt(prompt: str) -> str:
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            min_new_tokens=70,
-            max_new_tokens=150,
-            num_beams=4,
-            do_sample=False,
-            repetition_penalty=1.15,
+            max_new_tokens=180,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=20,
+            repetition_penalty=1.12,
             no_repeat_ngram_size=3,
-            early_stopping=True,
+            pad_token_id=tokenizer.eos_token_id,
         )
 
-    story = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
+    story = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    story = remove_qwen_thinking_text(story)
     return story.strip()
 
 
@@ -563,8 +628,21 @@ def clean_story_text(story: str) -> str:
     """
     Clean the generated story.
     """
-    story = story.replace("Story:", "").strip()
-    story = story.replace("Write only the story:", "").strip()
+    story = remove_qwen_thinking_text(story)
+
+    unwanted_labels = [
+        "Story:",
+        "Write only the story:",
+        "Beginning:",
+        "Middle:",
+        "Ending:",
+        "Answer:",
+        "Output:",
+    ]
+
+    for label in unwanted_labels:
+        story = story.replace(label, "")
+
     story = re.sub(r"\s+", " ", story).strip()
 
     story = remove_sensitive_sentences(story)
@@ -576,7 +654,7 @@ def clean_story_text(story: str) -> str:
 
 def make_length_repair_prompt(story: str, scenario_text: str) -> str:
     """
-    Ask the model to rewrite the story into the correct word range.
+    Ask Qwen3 to rewrite the story into the correct word range.
     """
     details = parse_scenario(scenario_text)
 
