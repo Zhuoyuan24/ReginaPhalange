@@ -6,6 +6,6 @@ sentencepiece
 accelerate
 scipy
 protobuf
-uroman
 timm
 safetensors
+gTTS
