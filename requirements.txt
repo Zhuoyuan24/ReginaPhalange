@@ -3,9 +3,6 @@ transformers
 torch
 Pillow
 sentencepiece
-accelerate
-scipy
 protobuf
-timm
 safetensors
 gTTS
