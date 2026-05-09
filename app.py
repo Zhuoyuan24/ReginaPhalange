@@ -1,6 +1,6 @@
 # ============================================================
 # ISOM5240 Individual Assignment
-# Storytelling Application using Hugging Face Pipelines
+# Storytelling Application using Hugging Face Models
 #
 # Professor's required structure:
 # 1. Import part
@@ -13,14 +13,21 @@
 # 1. IMPORT PART
 # ----------------------------
 import re
+from pathlib import Path
 from typing import Dict, Tuple
 from collections import Counter
-from pathlib import Path
 
 import streamlit as st
 from PIL import Image
-from transformers import pipeline
 import torch
+
+from transformers import (
+    pipeline,
+    BlipProcessor,
+    BlipForConditionalGeneration,
+    ViltProcessor,
+    ViltForQuestionAnswering,
+)
 
 
 # ----------------------------
@@ -31,7 +38,7 @@ import torch
 IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
 # Extra image-understanding models
-# These are used only to make the scenario more relevant to the uploaded picture.
+# These help the scenario contain more details from the picture.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 OBJECT_DETECTION_MODEL = "facebook/detr-resnet-50"
 
@@ -46,10 +53,17 @@ TTS_MODEL = "Matthijs/mms-tts-eng"
 # 3. FUNCTIONS PART
 # ----------------------------
 
-def get_device() -> int:
+def get_torch_device() -> torch.device:
     """
     Choose GPU if available, otherwise use CPU.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
+
+def get_pipeline_device() -> int:
+    """
     Hugging Face pipeline uses:
     device = 0  for GPU
     device = -1 for CPU
@@ -59,37 +73,45 @@ def get_device() -> int:
     return -1
 
 
-@st.cache_resource(show_spinner="Loading image captioning model...")
-def load_image_captioning_pipeline():
+@st.cache_resource(show_spinner="Loading BLIP image captioning model...")
+def load_image_captioning_model():
     """
-    Load the image-to-text pipeline.
+    Load the professor-provided BLIP image captioning model.
 
-    This model creates the first caption from the uploaded image.
+    Important:
+    We do NOT use pipeline("image-to-text") here because the current
+    Transformers environment may not support that task name.
     """
-    image_to_text_model = pipeline(
-        task="image-to-text",
-        model=IMAGE_CAPTION_MODEL,
-        device=get_device(),
-    )
-    return image_to_text_model
+    device = get_torch_device()
+
+    processor = BlipProcessor.from_pretrained(IMAGE_CAPTION_MODEL)
+    model = BlipForConditionalGeneration.from_pretrained(IMAGE_CAPTION_MODEL)
+
+    model.to(device)
+    model.eval()
+
+    return processor, model, device
 
 
 @st.cache_resource(show_spinner="Loading visual question answering model...")
-def load_vqa_pipeline():
+def load_vqa_model():
     """
-    Load the visual question answering pipeline.
+    Load the visual question answering model.
 
-    This model answers questions about the image, such as:
-    - Who is in the image?
-    - Where is the scene?
-    - What is happening?
+    This model helps answer questions about the image, such as:
+    - who is in the picture
+    - where the scene is
+    - what is happening
     """
-    vqa_model = pipeline(
-        task="visual-question-answering",
-        model=VQA_MODEL,
-        device=get_device(),
-    )
-    return vqa_model
+    device = get_torch_device()
+
+    processor = ViltProcessor.from_pretrained(VQA_MODEL)
+    model = ViltForQuestionAnswering.from_pretrained(VQA_MODEL)
+
+    model.to(device)
+    model.eval()
+
+    return processor, model, device
 
 
 @st.cache_resource(show_spinner="Loading object detection model...")
@@ -97,15 +119,16 @@ def load_object_detection_pipeline():
     """
     Load the object detection pipeline.
 
-    Important:
+    Note:
     facebook/detr-resnet-50 requires the timm package.
-    Add timm to requirements.txt.
+    Make sure timm is included in requirements.txt.
     """
     object_detection_model = pipeline(
         task="object-detection",
         model=OBJECT_DETECTION_MODEL,
-        device=get_device(),
+        device=get_pipeline_device(),
     )
+
     return object_detection_model
 
 
@@ -119,8 +142,9 @@ def load_story_pipeline():
     story_model = pipeline(
         task="text-generation",
         model=STORY_MODEL,
-        device=get_device(),
+        device=get_pipeline_device(),
     )
+
     return story_model
 
 
@@ -133,22 +157,45 @@ def load_tts_pipeline():
     pipeline("text-to-audio", model="Matthijs/mms-tts-eng")
 
     Some Transformers versions use "text-to-speech", so this function
-    tries the professor's version first and then uses a fallback.
+    tries text-to-audio first and then uses text-to-speech as fallback.
     """
     try:
         audio_model = pipeline(
             task="text-to-audio",
             model=TTS_MODEL,
-            device=get_device(),
+            device=get_pipeline_device(),
         )
     except Exception:
         audio_model = pipeline(
             task="text-to-speech",
             model=TTS_MODEL,
-            device=get_device(),
+            device=get_pipeline_device(),
         )
 
     return audio_model
+
+
+def generate_basic_caption(image: Image.Image) -> str:
+    """
+    Generate a basic image caption using the professor-provided BLIP model.
+
+    Returns:
+        A short caption, such as:
+        "a child playing with a dog in the park"
+    """
+    processor, model, device = load_image_captioning_model()
+
+    inputs = processor(image, return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=50,
+        )
+
+    caption = processor.decode(output_ids[0], skip_special_tokens=True)
+    return caption.strip()
 
 
 def ask_vqa_question(image: Image.Image, question: str) -> str:
@@ -160,29 +207,39 @@ def ask_vqa_question(image: Image.Image, question: str) -> str:
         question: question about the image
 
     Returns:
-        A short answer generated by the VQA model.
+        A short answer from the VQA model.
     """
-    vqa_model = load_vqa_pipeline()
-
     try:
-        result = vqa_model(image=image, question=question, top_k=1)
-    except TypeError:
-        result = vqa_model({"image": image, "question": question}, top_k=1)
+        processor, model, device = load_vqa_model()
 
-    if isinstance(result, list) and len(result) > 0:
-        answer = result[0].get("answer", "")
+        inputs = processor(
+            image,
+            question,
+            return_tensors="pt",
+        )
+
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        predicted_id = outputs.logits.argmax(-1).item()
+        answer = model.config.id2label[predicted_id]
+
         return str(answer).strip()
 
-    if isinstance(result, dict):
-        answer = result.get("answer", "")
-        return str(answer).strip()
-
-    return "unknown"
+    except Exception:
+        # The app should not stop if VQA fails.
+        return "unknown"
 
 
 def format_object_count(label: str, count: int) -> str:
     """
     Format detected object counts in simple English.
+
+    Example:
+        person, 2 -> 2 people
+        dog, 1 -> 1 dog
     """
     label = label.lower().strip()
 
@@ -215,34 +272,35 @@ def detect_main_objects(image: Image.Image, score_threshold: float = 0.80) -> st
     try:
         object_detector = load_object_detection_pipeline()
         detections = object_detector(image)
+
+        object_labels = []
+
+        for item in detections:
+            label = item.get("label", "").lower()
+            score = item.get("score", 0)
+
+            if label and score >= score_threshold:
+                object_labels.append(label)
+
+        if not object_labels:
+            return "no clear objects detected"
+
+        object_counts = Counter(object_labels)
+
+        object_summary = []
+        for label, count in object_counts.most_common(6):
+            object_summary.append(format_object_count(label, count))
+
+        return ", ".join(object_summary)
+
     except Exception:
-        # If object detection fails, the app can still continue using caption + VQA.
+        # The app should still work even if object detection fails.
         return "object detection unavailable"
-
-    object_labels = []
-
-    for item in detections:
-        label = item.get("label", "").lower()
-        score = item.get("score", 0)
-
-        if label and score >= score_threshold:
-            object_labels.append(label)
-
-    if not object_labels:
-        return "no clear objects detected"
-
-    object_counts = Counter(object_labels)
-
-    object_summary = []
-    for label, count in object_counts.most_common(6):
-        object_summary.append(format_object_count(label, count))
-
-    return ", ".join(object_summary)
 
 
 def img2text(url: str) -> str:
     """
-    Convert uploaded image into a rich scenario.
+    Convert uploaded image into a richer scenario.
 
     This follows the professor's required function style:
 
@@ -250,51 +308,52 @@ def img2text(url: str) -> str:
             ...
             return text
 
-    Main improvement:
-    Instead of using only one simple caption, this function combines:
-    1. BLIP image caption
-    2. VQA answers
-    3. Object detection results
+    The function extracts:
+    1. Basic caption
+    2. Main subject
+    3. People or characters
+    4. Location or setting
+    5. Main activity
+    6. Visible objects
+    7. Mood or theme
 
     This gives the story model more picture-specific information.
     """
     image = Image.open(url).convert("RGB")
 
-    # 1. Basic image caption using professor-provided model
-    image_to_text_model = load_image_captioning_pipeline()
-    caption_result = image_to_text_model(image)
-    caption = caption_result[0].get("generated_text", "").strip()
+    # 1. Basic image caption using BLIP
+    caption = generate_basic_caption(image)
 
-    # 2. Ask visual questions about the image
-    who = ask_vqa_question(image, "Who is in the picture?")
+    # 2. Ask image-specific questions using VQA
+    main_subject = ask_vqa_question(image, "What is the main subject of the image?")
+    people = ask_vqa_question(image, "Who is in the picture?")
     place = ask_vqa_question(image, "Where is the scene?")
     activity = ask_vqa_question(image, "What is happening in the image?")
-    main_subject = ask_vqa_question(image, "What is the main subject of the image?")
     mood = ask_vqa_question(image, "What is the mood of the image?")
 
-    # 3. Detect important objects
+    # 3. Detect important visible objects
     objects = detect_main_objects(image)
 
     # 4. Combine all image information into one scenario
-    scenario = (
+    text = (
         f"Image caption: {caption}. "
         f"Main subject: {main_subject}. "
-        f"People or characters: {who}. "
+        f"People or characters: {people}. "
         f"Location or setting: {place}. "
         f"Main activity: {activity}. "
         f"Visible objects: {objects}. "
         f"Mood or theme: {mood}."
     )
 
-    return scenario
+    return text
 
 
-def build_story_prompt(scenario: str) -> str:
+def build_story_prompt(text: str) -> str:
     """
     Build a clear prompt for the story-generation model.
 
-    No user-selected genre, lesson, or age is used here.
-    The story should focus only on the uploaded picture.
+    This version removes user-selected genre, lesson, and age.
+    It focuses only on the uploaded picture.
     """
     prompt = (
         "Write a short story for young children based only on the image details below. "
@@ -304,7 +363,7 @@ def build_story_prompt(scenario: str) -> str:
         "Use simple, warm, child-friendly English. "
         "Keep the story between 50 and 100 words. "
         "Do not include scary, violent, or adult content. "
-        f"Image details: {scenario} "
+        f"Image details: {text} "
         "Story:"
     )
 
@@ -338,24 +397,24 @@ def limit_story_length(story: str, max_words: int = 100) -> str:
     return shortened_story
 
 
-def make_simple_backup_story(scenario: str) -> str:
+def make_simple_backup_story(text: str) -> str:
     """
     Create a simple backup story if the text-generation model output is too short.
 
-    This backup still uses the image scenario, so the story remains related
+    The backup story still uses the image scenario, so it remains related
     to the uploaded image.
     """
     backup_story = (
-        f"In the picture, there is a special scene: {scenario} "
+        f"In the picture, we can see this scene: {text} "
         "A little explorer looks carefully at the people, place, and objects around them. "
-        "The moment feels simple but meaningful. Everyone enjoys what they are doing, "
+        "The moment feels simple, warm, and special. Everyone enjoys what they are doing, "
         "and the small scene becomes a happy story about noticing the world with kindness."
     )
 
     return limit_story_length(backup_story, max_words=100)
 
 
-def clean_story_text(raw_story: str, prompt: str, scenario: str) -> str:
+def clean_story_text(raw_story: str, prompt: str, text: str) -> str:
     """
     Clean and check the generated story.
 
@@ -369,7 +428,7 @@ def clean_story_text(raw_story: str, prompt: str, scenario: str) -> str:
     story = limit_story_length(story, max_words=100)
 
     if len(story.split()) < 40:
-        story = make_simple_backup_story(scenario)
+        story = make_simple_backup_story(text)
 
     return story
 
@@ -418,10 +477,11 @@ def text2story(text: str) -> str:
         )
 
     raw_story = story_results[0]["generated_text"]
+
     story_text = clean_story_text(
         raw_story=raw_story,
         prompt=prompt,
-        scenario=text,
+        text=text,
     )
 
     return story_text
@@ -503,7 +563,7 @@ def main():
     Main Streamlit application.
 
     Execution flow:
-    upload image -> show image -> image to text -> story -> audio
+    upload image -> show image -> img2text -> text2story -> text2audio
     """
     st.set_page_config(
         page_title="Your Image to Audio Story",
@@ -524,7 +584,6 @@ def main():
         key="story_image_uploader",
     )
 
-    # Only run the main processing steps if the user uploads an image.
     if uploaded_file is not None:
         image_path = save_uploaded_image(uploaded_file)
 
@@ -556,9 +615,7 @@ def main():
                     audio_array, sample_rate = text2audio(story)
 
                 st.subheader("3. Story Audio")
-
-                if st.button("Play Audio"):
-                    st.audio(audio_array, sample_rate=sample_rate)
+                st.audio(audio_array, sample_rate=sample_rate)
 
                 st.success("Done! The image has been converted into a story and audio.")
 
