@@ -1,14 +1,21 @@
 # ============================================================
 # ISOM5240 Individual Assignment
 # Storytelling Application using Hugging Face Pipelines
-# Structure follows: Import part -> Functions part -> Main part
+#
+# Structure follows professor's template:
+# 1. Import part
+# 2. Functions part
+# 3. Main part
 # ============================================================
+
 
 # ----------------------------
 # 1. IMPORT PART
 # ----------------------------
 import re
 from typing import Dict, Tuple
+from collections import Counter
+from pathlib import Path
 
 import streamlit as st
 from PIL import Image
@@ -17,71 +24,267 @@ import torch
 
 
 # ----------------------------
-# 2. CONSTANTS / MODEL SETTINGS
+# 2. MODEL SETTINGS
 # ----------------------------
+
+# Professor-provided image captioning model
 IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
+
+# Additional image-understanding models
+# These help make the story more relevant to the uploaded picture.
+VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
+OBJECT_DETECTION_MODEL = "facebook/detr-resnet-50"
+
+# Professor-provided story generation model
 STORY_MODEL = "pranavpsv/genre-story-generator-v2"
-TTS_MODEL = "facebook/mms-tts-eng"   # Alternative from professor notes: "Matthijs/mms-tts-eng"
+
+# Professor-provided text-to-audio model
+TTS_MODEL = "Matthijs/mms-tts-eng"
 
 
 # ----------------------------
 # 3. FUNCTIONS PART
 # ----------------------------
+
 def get_device() -> int:
     """
-    Return GPU device number if CUDA is available; otherwise use CPU.
-    Hugging Face pipeline uses device=-1 for CPU and device=0 for first GPU.
+    Choose GPU if available, otherwise use CPU.
+
+    Hugging Face pipeline uses:
+    device = 0  for GPU
+    device = -1 for CPU
     """
-    return 0 if torch.cuda.is_available() else -1
+    if torch.cuda.is_available():
+        return 0
+    return -1
 
 
 @st.cache_resource(show_spinner="Loading image captioning model...")
 def load_image_captioning_pipeline():
-    """Load and cache the image-to-text pipeline."""
-    return pipeline(
+    """
+    Load the image-to-text pipeline.
+
+    This model creates the first caption from the uploaded image.
+    """
+    image_to_text_model = pipeline(
         task="image-to-text",
         model=IMAGE_CAPTION_MODEL,
         device=get_device(),
     )
+    return image_to_text_model
+
+
+@st.cache_resource(show_spinner="Loading visual question answering model...")
+def load_vqa_pipeline():
+    """
+    Load the visual question answering pipeline.
+
+    This model answers questions about the image, such as:
+    - Who is in the image?
+    - Where is the scene?
+    - What is happening?
+    """
+    vqa_model = pipeline(
+        task="visual-question-answering",
+        model=VQA_MODEL,
+        device=get_device(),
+    )
+    return vqa_model
+
+
+@st.cache_resource(show_spinner="Loading object detection model...")
+def load_object_detection_pipeline():
+    """
+    Load the object detection pipeline.
+
+    This model identifies visible objects in the image, such as:
+    person, dog, ball, bicycle, chair, table, etc.
+    """
+    object_detection_model = pipeline(
+        task="object-detection",
+        model=OBJECT_DETECTION_MODEL,
+        device=get_device(),
+    )
+    return object_detection_model
 
 
 @st.cache_resource(show_spinner="Loading story generation model...")
 def load_story_pipeline():
-    """Load and cache the text-generation pipeline."""
-    return pipeline(
+    """
+    Load the text-generation pipeline.
+
+    This model expands the image scenario into a short story.
+    """
+    story_model = pipeline(
         task="text-generation",
         model=STORY_MODEL,
         device=get_device(),
     )
+    return story_model
 
 
-@st.cache_resource(show_spinner="Loading text-to-speech model...")
+@st.cache_resource(show_spinner="Loading text-to-audio model...")
 def load_tts_pipeline():
-    """Load and cache the text-to-speech pipeline."""
-    return pipeline(
-        task="text-to-speech",
-        model=TTS_MODEL,
-        device=get_device(),
-    )
-
-
-def img2text(image: Image.Image) -> str:
     """
-    Convert an uploaded image into a short scenario/caption.
+    Load the text-to-audio pipeline.
+
+    The professor's template uses:
+    pipeline("text-to-audio", model="Matthijs/mms-tts-eng")
+
+    Some Transformers versions may use "text-to-speech", so this function
+    tries the professor's version first and uses a fallback if needed.
+    """
+    try:
+        audio_model = pipeline(
+            task="text-to-audio",
+            model=TTS_MODEL,
+            device=get_device(),
+        )
+    except Exception:
+        audio_model = pipeline(
+            task="text-to-speech",
+            model=TTS_MODEL,
+            device=get_device(),
+        )
+
+    return audio_model
+
+
+def ask_vqa_question(image: Image.Image, question: str) -> str:
+    """
+    Ask a visual question about the uploaded image.
 
     Parameters:
-        image: PIL image uploaded by user.
+        image: PIL image
+        question: question about the image
 
     Returns:
-        A short text caption describing the image.
+        A short answer generated by the VQA model.
     """
-    image_to_text_model = load_image_captioning_pipeline()
-    result = image_to_text_model(image)
+    vqa_model = load_vqa_pipeline()
 
-    # The output is normally a list of dictionaries:
-    # [{'generated_text': 'a child playing in a park'}]
-    scenario = result[0].get("generated_text", "")
-    return scenario.strip()
+    try:
+        result = vqa_model(image=image, question=question, top_k=1)
+    except TypeError:
+        # Fallback format for some Transformers versions
+        result = vqa_model({"image": image, "question": question}, top_k=1)
+
+    if isinstance(result, list) and len(result) > 0:
+        answer = result[0].get("answer", "")
+        return str(answer).strip()
+
+    if isinstance(result, dict):
+        answer = result.get("answer", "")
+        return str(answer).strip()
+
+    return "unknown"
+
+
+def format_object_count(label: str, count: int) -> str:
+    """
+    Format detected object counts in simple English.
+
+    Example:
+        person, 2 -> 2 people
+        dog, 1 -> 1 dog
+        bus, 2 -> 2 buses
+    """
+    label = label.lower().strip()
+
+    if count == 1:
+        return f"1 {label}"
+
+    if label == "person":
+        return f"{count} people"
+
+    if label.endswith("s"):
+        return f"{count} {label}es"
+
+    if label.endswith("y"):
+        return f"{count} {label[:-1]}ies"
+
+    return f"{count} {label}s"
+
+
+def detect_main_objects(image: Image.Image, score_threshold: float = 0.80) -> str:
+    """
+    Detect visible objects in the uploaded image.
+
+    Parameters:
+        image: PIL image
+        score_threshold: minimum confidence score for keeping detected objects
+
+    Returns:
+        A short text summary of the main objects.
+    """
+    object_detector = load_object_detection_pipeline()
+    detections = object_detector(image)
+
+    object_labels = []
+
+    for item in detections:
+        label = item.get("label", "").lower()
+        score = item.get("score", 0)
+
+        if label and score >= score_threshold:
+            object_labels.append(label)
+
+    if not object_labels:
+        return "no clear objects detected"
+
+    object_counts = Counter(object_labels)
+
+    object_summary = []
+    for label, count in object_counts.most_common(6):
+        object_summary.append(format_object_count(label, count))
+
+    return ", ".join(object_summary)
+
+
+def img2text(url: str) -> str:
+    """
+    Convert uploaded image into a rich scenario.
+
+    This follows the professor's required function style:
+        def img2text(url):
+            ...
+            return text
+
+    Main improvement:
+    Instead of using only one image caption, this function combines:
+    1. Image caption from BLIP
+    2. VQA answers about people, place, activity, and mood
+    3. Object detection results
+
+    This gives the story model more image-specific information.
+    """
+    image = Image.open(url).convert("RGB")
+
+    # 1. Basic image caption
+    image_to_text_model = load_image_captioning_pipeline()
+    caption_result = image_to_text_model(image)
+    caption = caption_result[0].get("generated_text", "").strip()
+
+    # 2. Ask visual questions about the image
+    who = ask_vqa_question(image, "Who is in the picture?")
+    place = ask_vqa_question(image, "Where is the scene?")
+    activity = ask_vqa_question(image, "What is happening in the image?")
+    mood = ask_vqa_question(image, "What is the mood of the image?")
+
+    # 3. Detect important objects
+    objects = detect_main_objects(image)
+
+    # 4. Combine all image information into one scenario
+    scenario = (
+        f"Image caption: {caption}. "
+        f"People or characters: {who}. "
+        f"Location or setting: {place}. "
+        f"Main activity: {activity}. "
+        f"Visible objects: {objects}. "
+        f"Mood or theme: {mood}."
+    )
+
+    return scenario
 
 
 def build_story_prompt(
@@ -91,160 +294,266 @@ def build_story_prompt(
     audience_age: int,
 ) -> str:
     """
-    Create a clear prompt for the story-generation model.
-    The prompt is designed to produce a safe 50-100 word story for kids.
+    Build a clear prompt for the story-generation model.
+
+    The prompt strongly asks the model to base the story on the image details.
     """
     prompt = (
         f"Write a short {genre.lower()} story for a {audience_age}-year-old child. "
-        f"The story should be based on this scene: {scenario}. "
+        f"Base the story only on these image details: {scenario} "
+        f"The story should include the people, place, activity, and objects from the image. "
         f"The story should teach this lesson: {lesson}. "
         "Use simple, warm, child-friendly English. "
         "Keep the story between 50 and 100 words. "
         "Do not include scary, violent, or adult content. "
         "Story:"
     )
+
     return prompt
 
 
-def clean_story_text(raw_story: str, prompt: str) -> str:
+def extract_story_only(raw_story: str, prompt: str) -> str:
     """
-    Clean the generated story:
-    - Remove the prompt if it appears in the model output.
-    - Remove extra spaces.
-    - Cut the story to about 100 words to match assignment requirement.
+    Remove prompt text and extra formatting from the generated story.
     """
     story = raw_story.replace(prompt, "").strip()
     story = story.replace("Story:", "").strip()
     story = re.sub(r"\s+", " ", story)
+    return story
 
+
+def limit_story_length(story: str, max_words: int = 100) -> str:
+    """
+    Limit the story length to match the assignment requirement.
+    """
     words = story.split()
-    if len(words) > 100:
-        story = " ".join(words[:100])
-        # End more naturally if possible.
-        if not story.endswith((".", "!", "?")):
-            story += "."
 
-    # Very short fallback in case the model returns empty or low-quality text.
-    if len(story.split()) < 30:
-        story = (
-            "Once upon a time, a little explorer saw something wonderful in the picture. "
-            "With a brave heart and a kind smile, the explorer learned to help others, "
-            "share joy, and keep trying. By the end of the day, everyone felt proud, "
-            "because even small acts of kindness can make a big difference."
-        )
+    if len(words) <= max_words:
+        return story
+
+    shortened_story = " ".join(words[:max_words])
+
+    if not shortened_story.endswith((".", "!", "?")):
+        shortened_story += "."
+
+    return shortened_story
+
+
+def make_simple_backup_story(scenario: str, lesson: str) -> str:
+    """
+    Create a simple backup story if the text-generation model output is too short
+    or not useful.
+
+    This backup is still based on the image scenario, so it remains relevant.
+    """
+    backup_story = (
+        f"In the picture, there is a special scene: {scenario} "
+        f"A little explorer notices the people, place, and objects around them. "
+        f"Everyone learns to {lesson.lower()}. "
+        "By the end of the day, they feel happy and proud, because a small kind action "
+        "can make an ordinary moment become a wonderful story."
+    )
+
+    return limit_story_length(backup_story, max_words=100)
+
+
+def clean_story_text(
+    raw_story: str,
+    prompt: str,
+    scenario: str,
+    lesson: str,
+) -> str:
+    """
+    Clean and check the generated story.
+
+    Steps:
+    1. Remove prompt text.
+    2. Remove extra spaces.
+    3. Cut story to 100 words if needed.
+    4. Use a simple image-based backup story if output is too short.
+    """
+    story = extract_story_only(raw_story, prompt)
+    story = limit_story_length(story, max_words=100)
+
+    # If generated story is too short, use a more reliable image-based backup.
+    if len(story.split()) < 40:
+        story = make_simple_backup_story(scenario, lesson)
 
     return story
 
 
 def text2story(
-    scenario: str,
+    text: str,
     genre: str = "Adventure",
     lesson: str = "Be kind and curious",
     audience_age: int = 6,
 ) -> str:
     """
-    Generate a short story from the image scenario.
+    Convert image scenario text into a short story.
+
+    This follows the professor's required function style:
+        def text2story(text):
+            ...
+            return story_text
 
     Parameters:
-        scenario: caption generated from image.
-        genre: selected story style.
-        lesson: moral/lesson selected by user.
-        audience_age: intended child age.
+        text: rich image scenario from img2text()
+        genre: selected story type
+        lesson: selected lesson
+        audience_age: target child age
 
     Returns:
-        A 50-100 word child-friendly story.
+        story_text: generated story
     """
     story_model = load_story_pipeline()
-    prompt = build_story_prompt(scenario, genre, lesson, audience_age)
+
+    prompt = build_story_prompt(
+        scenario=text,
+        genre=genre,
+        lesson=lesson,
+        audience_age=audience_age,
+    )
 
     try:
-        result = story_model(
+        story_results = story_model(
             prompt,
-            max_new_tokens=120,
+            max_new_tokens=100,
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
+            temperature=0.55,
+            top_p=0.85,
+            repetition_penalty=1.20,
             no_repeat_ngram_size=3,
             num_return_sequences=1,
             return_full_text=False,
         )
-        raw_story = result[0]["generated_text"]
     except TypeError:
-        # Some older pipelines may not support return_full_text.
-        result = story_model(
+        # Some older Transformers versions may not support return_full_text.
+        story_results = story_model(
             prompt,
-            max_new_tokens=120,
+            max_new_tokens=100,
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
+            temperature=0.55,
+            top_p=0.85,
+            repetition_penalty=1.20,
             no_repeat_ngram_size=3,
             num_return_sequences=1,
         )
-        raw_story = result[0]["generated_text"]
 
-    return clean_story_text(raw_story, prompt)
+    raw_story = story_results[0]["generated_text"]
+
+    story_text = clean_story_text(
+        raw_story=raw_story,
+        prompt=prompt,
+        scenario=text,
+        lesson=lesson,
+    )
+
+    return story_text
 
 
 def text2audio(story_text: str) -> Tuple[object, int]:
     """
-    Convert story text into audio.
+    Convert generated story text into audio.
+
+    This follows the professor's required function style:
+        def text2audio(story_text):
+            ...
+            return audio_data
 
     Returns:
-        audio_array: waveform/audio data
-        sample_rate: sampling rate needed by st.audio
+        audio_array: audio waveform
+        sample_rate: audio sample rate for st.audio()
     """
     audio_model = load_tts_pipeline()
     audio_data: Dict = audio_model(story_text)
+
     audio_array = audio_data["audio"]
     sample_rate = audio_data["sampling_rate"]
+
     return audio_array, sample_rate
 
 
-def show_assignment_sidebar():
-    """Show a short app explanation in the sidebar."""
+def save_uploaded_image(uploaded_file) -> str:
+    """
+    Save uploaded image locally, following the professor's example.
+
+    Returns:
+        image_path: local file path for the uploaded image
+    """
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix not in [".jpg", ".jpeg", ".png"]:
+        suffix = ".png"
+
+    image_path = f"uploaded_image{suffix}"
+
+    bytes_data = uploaded_file.getvalue()
+
+    with open(image_path, "wb") as file:
+        file.write(bytes_data)
+
+    return image_path
+
+
+def show_sidebar():
+    """
+    Show app explanation in the sidebar.
+    """
     st.sidebar.title("How this app works")
     st.sidebar.write(
         "1. Upload an image.\n"
-        "2. The app describes the image as a scenario.\n"
-        "3. The scenario becomes a short kid-friendly story.\n"
-        "4. The story is converted into audio."
+        "2. The app extracts image details.\n"
+        "3. The app creates a short story.\n"
+        "4. The app converts the story into audio."
     )
+
     st.sidebar.divider()
-    st.sidebar.caption("Built for ISOM5240 Individual Assignment")
+
+    st.sidebar.write("Models used:")
+    st.sidebar.caption("Image caption: Salesforce/blip-image-captioning-base")
+    st.sidebar.caption("Visual Q&A: dandelin/vilt-b32-finetuned-vqa")
+    st.sidebar.caption("Object detection: facebook/detr-resnet-50")
+    st.sidebar.caption("Story: pranavpsv/genre-story-generator-v2")
+    st.sidebar.caption("Audio: Matthijs/mms-tts-eng")
 
 
 # ----------------------------
 # 4. MAIN PART
 # ----------------------------
+
 def main():
-    """Main Streamlit app."""
+    """
+    Main Streamlit application.
+
+    This part controls what the user sees and the order of execution:
+    upload image -> show image -> image to text -> story -> audio
+    """
     st.set_page_config(
-        page_title="Image to Audio Story",
-        page_icon="📚",
+        page_title="Your Image to Audio Story",
+        page_icon="🦜",
         layout="centered",
     )
 
-    show_assignment_sidebar()
+    show_sidebar()
 
-    st.title("📚 Turn Your Image into an Audio Story")
-    st.write(
-        "Upload an image, choose a few story settings, and the app will create "
-        "a short story with audio for young children."
-    )
+    st.title("🦜 Your Image to Audio Story")
+    st.write("Upload an image and turn it into a short audio story for kids.")
+
+    st.divider()
 
     uploaded_file = st.file_uploader(
-        "Upload a JPG, JPEG, or PNG image",
+        "Select an Image...",
         type=["jpg", "jpeg", "png"],
         key="story_image_uploader",
     )
 
     genre = st.selectbox(
-        "Choose a story style",
+        "Choose a story style:",
         options=["Adventure", "Fantasy", "Friendship", "Animal Story", "Bedtime"],
     )
 
     lesson = st.selectbox(
-        "Choose a simple lesson",
+        "Choose a simple lesson:",
         options=[
             "Be kind and curious",
             "Share with friends",
@@ -255,49 +564,62 @@ def main():
     )
 
     audience_age = st.slider(
-        "Target child age",
+        "Choose the target child age:",
         min_value=3,
         max_value=10,
         value=6,
     )
 
-    if uploaded_file is None:
-        st.info("Please upload an image to start the story generation process.")
-        return
+    # Only run the main processing steps if the user uploads an image.
+    if uploaded_file is not None:
+        image_path = save_uploaded_image(uploaded_file)
 
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_container_width=True)
+        st.subheader("Uploaded Image")
+        st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
 
-    if st.button("Generate Story and Audio", type="primary"):
-        try:
-            with st.spinner("Step 1/3: Understanding the image..."):
-                scenario = img2text(image)
+        if st.button("Generate Story and Audio", type="primary"):
+            try:
+                # Stage 1: Image to text
+                st.text("Processing img2text...")
+                with st.spinner("Understanding the image..."):
+                    scenario = img2text(image_path)
 
-            st.subheader("1. Generated Scenario")
-            st.write(scenario)
+                st.subheader("1. Generated Scenario")
+                st.write(scenario)
 
-            with st.spinner("Step 2/3: Writing a short story..."):
-                story = text2story(
-                    scenario=scenario,
-                    genre=genre,
-                    lesson=lesson,
-                    audience_age=audience_age,
-                )
+                # Stage 2: Text to story
+                st.text("Generating a story...")
+                with st.spinner("Writing a short child-friendly story..."):
+                    story = text2story(
+                        text=scenario,
+                        genre=genre,
+                        lesson=lesson,
+                        audience_age=audience_age,
+                    )
 
-            st.subheader("2. Generated Story")
-            st.write(story)
-            st.caption(f"Word count: {len(story.split())} words")
+                st.subheader("2. Generated Story")
+                st.write(story)
+                st.caption(f"Word count: {len(story.split())} words")
 
-            with st.spinner("Step 3/3: Creating audio..."):
-                audio_array, sample_rate = text2audio(story)
+                # Stage 3: Story to audio
+                st.text("Generating audio data...")
+                with st.spinner("Creating audio..."):
+                    audio_array, sample_rate = text2audio(story)
 
-            st.subheader("3. Story Audio")
-            st.audio(audio_array, sample_rate=sample_rate)
-            st.success("Done! The image has been converted into a story and audio.")
+                st.subheader("3. Story Audio")
 
-        except Exception as error:
-            st.error("Something went wrong while generating the story or audio.")
-            st.exception(error)
+                # Play audio button
+                if st.button("Play Audio"):
+                    st.audio(audio_array, sample_rate=sample_rate)
+
+                st.success("Done! The image has been converted into a story and audio.")
+
+            except Exception as error:
+                st.error("Something went wrong while generating the story or audio.")
+                st.exception(error)
+
+    else:
+        st.info("Please upload an image to start.")
 
 
 if __name__ == "__main__":
