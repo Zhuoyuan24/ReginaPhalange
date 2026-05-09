@@ -23,12 +23,12 @@ import torch
 from gtts import gTTS
 
 from transformers import (
+    pipeline,
+    set_seed,
     BlipProcessor,
     BlipForConditionalGeneration,
     ViltProcessor,
     ViltForQuestionAnswering,
-    AutoTokenizer,
-    AutoModelForCausalLM,
 )
 
 
@@ -43,20 +43,14 @@ IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 # Used to extract character, setting, activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
-# Qwen3 story generation model
-# Qwen3-0.6B is the smallest Qwen3 model and is more suitable for Streamlit Cloud.
-STORY_MODEL = "Qwen/Qwen3-0.6B"
-
-# Qwen3 citation:
-# @misc{qwen3technicalreport,
-#       title={Qwen3 Technical Report},
-#       author={Qwen Team},
-#       year={2025},
-#       eprint={2505.09388},
-#       archivePrefix={arXiv},
-#       primaryClass={cs.CL},
-#       url={https://arxiv.org/abs/2505.09388},
+# GPT-2 story generation model
+# Citation:
+# @article{radford2019language,
+#   title={Language Models are Unsupervised Multitask Learners},
+#   author={Radford, Alec and Wu, Jeff and Child, Rewon and Luan, David and Amodei, Dario and Sutskever, Ilya},
+#   year={2019}
 # }
+STORY_MODEL = "gpt2"
 
 
 # ----------------------------
@@ -70,6 +64,17 @@ def get_torch_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def get_pipeline_device() -> int:
+    """
+    Hugging Face pipeline uses:
+    device = 0 for GPU
+    device = -1 for CPU
+    """
+    if torch.cuda.is_available():
+        return 0
+    return -1
 
 
 @st.cache_resource(show_spinner="Loading image captioning model...")
@@ -113,33 +118,21 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading Qwen3 story generation model...")
-def load_story_model():
+@st.cache_resource(show_spinner="Loading GPT-2 story model...")
+def load_story_pipeline():
     """
-    Load Qwen3 for instruction-following story generation.
+    Load GPT-2 using Hugging Face text-generation pipeline.
 
-    Qwen3 is a causal language model, so we use:
-    AutoTokenizer + AutoModelForCausalLM.
+    This follows the professor's template more closely because it uses:
+    pipeline("text-generation", model="gpt2")
     """
-    device = get_torch_device()
+    story_pipe = pipeline(
+        task="text-generation",
+        model=STORY_MODEL,
+        device=get_pipeline_device(),
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(STORY_MODEL)
-
-    if torch.cuda.is_available():
-        model = AutoModelForCausalLM.from_pretrained(
-            STORY_MODEL,
-            torch_dtype=torch.bfloat16,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            STORY_MODEL,
-            torch_dtype=torch.float32,
-        )
-
-    model.to(device)
-    model.eval()
-
-    return tokenizer, model, device
+    return story_pipe
 
 
 def generate_basic_caption(image: Image.Image) -> str:
@@ -361,16 +354,13 @@ def img2text(url: str) -> str:
     """
     image = Image.open(url).convert("RGB")
 
-    # Basic image caption
     caption = generate_basic_caption(image)
 
-    # Ask visual questions
     character_answer = ask_vqa_question(image, "Who is the main character in the image?")
     setting_answer = ask_vqa_question(image, "Where is the scene?")
     activity_answer = ask_vqa_question(image, "What is the main activity?")
     weather_answer = ask_vqa_question(image, "What is the weather or environment like?")
 
-    # Normalize answers into natural phrases
     character = choose_character(caption, character_answer)
     setting = choose_setting(caption, setting_answer)
     activity = choose_activity(caption, activity_answer)
@@ -419,114 +409,54 @@ def parse_scenario(text: str) -> Dict[str, str]:
 
 def build_story_prompt(text: str) -> str:
     """
-    Build a clear image-grounded story prompt.
+    Build a GPT-2-friendly story starter.
 
-    This prompt explicitly asks the model to create:
-    - beginning
-    - middle
-    - ending
+    GPT-2 is not as good at following strict instructions as FLAN-T5 or Qwen.
+    Therefore, the prompt is written as a story starter instead of a long command.
     """
     details = parse_scenario(text)
 
-    prompt = f"""
-Write one complete short story for children aged 3 to 10.
+    prompt = (
+        "Children's story for ages 3 to 10.\n"
+        f"Character: {details['character']}.\n"
+        f"Setting: {details['setting']}.\n"
+        f"Weather: {details['weather']}.\n"
+        f"Activity: {details['activity']}.\n"
+        f"Original scene: {details['caption']}.\n\n"
+        "The story has a clear beginning, middle, and happy ending. "
+        "It uses simple, safe, child-friendly English. "
+        "It does not include scary, violent, romantic, or adult content.\n\n"
+        f"Story: One day, {details['character']} was {details['setting']}. "
+    )
 
-Use these picture details naturally:
-Character: {details["character"]}
-Setting: {details["setting"]}
-Weather or environment: {details["weather"]}
-Activity: {details["activity"]}
-Original caption: {details["caption"]}
-
-Story structure:
-Beginning: introduce the character, setting, and weather.
-Middle: describe a small action during the activity.
-Ending: finish with a happy, simple ending.
-
-Story requirements:
-- 70 to 90 words
-- simple child-friendly English
-- directly related to the picture details
-- do not list the details
-- do not mention the words "image", "caption", or "picture"
-- no scary, violent, romantic, or adult content
-
-Write only the story:
-"""
-    return prompt.strip()
-
-
-def remove_qwen_thinking_text(text: str) -> str:
-    """
-    Remove Qwen thinking blocks if they appear.
-
-    We set enable_thinking=False, but this cleaning step is included for safety.
-    """
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-    if "</think>" in text:
-        text = text.split("</think>")[-1].strip()
-
-    return text
+    return prompt
 
 
 def generate_story_from_prompt(prompt: str) -> str:
     """
-    Generate a story using Qwen3.
-
-    Qwen3 uses a chat template. We disable thinking mode for faster,
-    direct story generation.
+    Generate a story using GPT-2 text-generation pipeline.
     """
-    tokenizer, model, device = load_story_model()
+    story_pipe = load_story_pipeline()
 
-    messages = [
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    ]
+    set_seed(42)
 
-    try:
-        formatted_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        formatted_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    inputs = tokenizer(
-        [formatted_prompt],
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
+    result = story_pipe(
+        prompt,
+        max_new_tokens=130,
+        do_sample=True,
+        temperature=0.75,
+        top_p=0.90,
+        repetition_penalty=1.20,
+        no_repeat_ngram_size=3,
+        num_return_sequences=1,
+        pad_token_id=story_pipe.tokenizer.eos_token_id,
     )
 
-    inputs = {key: value.to(device) for key, value in inputs.items()}
+    raw_text = result[0]["generated_text"]
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=180,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.8,
-            top_k=20,
-            repetition_penalty=1.12,
-            no_repeat_ngram_size=3,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    story = raw_text.replace(prompt, "").strip()
 
-    generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
-    story = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    story = remove_qwen_thinking_text(story)
-    return story.strip()
+    return story
 
 
 def remove_sensitive_sentences(story: str) -> str:
@@ -548,6 +478,8 @@ def remove_sensitive_sentences(story: str) -> str:
         "adult",
         "drunk",
         "wine",
+        "sex",
+        "naked",
     ]
 
     sentences = re.findall(r"[^.!?]+[.!?]", story)
@@ -559,8 +491,8 @@ def remove_sensitive_sentences(story: str) -> str:
 
     for sentence in sentences:
         sentence_lower = sentence.lower()
-        has_sensitive_word = False
 
+        has_sensitive_word = False
         for word in sensitive_words:
             if word in sentence_lower:
                 has_sensitive_word = True
@@ -628,16 +560,14 @@ def clean_story_text(story: str) -> str:
     """
     Clean the generated story.
     """
-    story = remove_qwen_thinking_text(story)
-
     unwanted_labels = [
         "Story:",
-        "Write only the story:",
         "Beginning:",
         "Middle:",
         "Ending:",
         "Answer:",
         "Output:",
+        "Children's story:",
     ]
 
     for label in unwanted_labels:
@@ -654,39 +584,31 @@ def clean_story_text(story: str) -> str:
 
 def make_length_repair_prompt(story: str, scenario_text: str) -> str:
     """
-    Ask Qwen3 to rewrite the story into the correct word range.
+    Create a second GPT-2 prompt if the first story is too short.
+
+    Because GPT-2 is a continuation model, this repair prompt gives it
+    another story starter instead of asking it to strictly rewrite.
     """
     details = parse_scenario(scenario_text)
 
-    prompt = f"""
-Rewrite the story below so it is 70 to 90 words long.
+    prompt = (
+        "Children's story for ages 3 to 10.\n"
+        f"Character: {details['character']}.\n"
+        f"Setting: {details['setting']}.\n"
+        f"Weather: {details['weather']}.\n"
+        f"Activity: {details['activity']}.\n"
+        f"Original scene: {details['caption']}.\n\n"
+        "This is a complete 70 to 90 word story with a beginning, middle, and happy ending. "
+        "The story is safe, warm, and easy for children to understand.\n\n"
+        f"Story: One day, {details['character']} was {details['setting']}. "
+    )
 
-Keep it child-friendly for ages 3 to 10.
-Keep a clear beginning, middle, and happy ending.
-Keep it directly related to these picture details:
-Character: {details["character"]}
-Setting: {details["setting"]}
-Weather or environment: {details["weather"]}
-Activity: {details["activity"]}
-Original caption: {details["caption"]}
-
-Do not mention the words "image", "caption", or "picture".
-Do not include scary, violent, romantic, or adult content.
-
-Story to rewrite:
-{story}
-
-Rewritten story:
-"""
-    return prompt.strip()
+    return prompt
 
 
 def add_image_based_closing_sentence(story: str, scenario_text: str) -> str:
     """
-    Add one final sentence if the story is still under 50 words.
-
-    This is not a backup story. It only extends the generated story
-    using the extracted image details.
+    Add one final image-based sentence if the story is still under 50 words.
     """
     details = parse_scenario(scenario_text)
 
@@ -754,8 +676,6 @@ def text2story(text: str) -> str:
         def text2story(text):
             story_text = ...
             return story_text
-
-    The final story is checked and repaired to stay within 50-100 words.
     """
     prompt = build_story_prompt(text)
 
@@ -777,7 +697,6 @@ def prepare_text_for_audio(story_text: str) -> str:
     """
     story_text = re.sub(r"\s+", " ", story_text).strip()
 
-    # Extra spaces after punctuation help the audio pause more naturally.
     story_text = story_text.replace(". ", ".  ")
     story_text = story_text.replace("! ", "!  ")
     story_text = story_text.replace("? ", "?  ")
