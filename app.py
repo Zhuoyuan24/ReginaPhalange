@@ -23,12 +23,12 @@ import torch
 from gtts import gTTS
 
 from transformers import (
-    pipeline,
-    set_seed,
     BlipProcessor,
     BlipForConditionalGeneration,
     ViltProcessor,
     ViltForQuestionAnswering,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
 )
 
 
@@ -43,14 +43,9 @@ IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 # Used to extract character, setting, activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
-# GPT-2 story generation model
-# Citation:
-# @article{radford2019language,
-#   title={Language Models are Unsupervised Multitask Learners},
-#   author={Radford, Alec and Wu, Jeff and Child, Rewon and Luan, David and Amodei, Dario and Sutskever, Ilya},
-#   year={2019}
-# }
-STORY_MODEL = "gpt2"
+# Story generation model
+# FLAN-T5 Large is stronger than FLAN-T5 Base and better at following instructions.
+STORY_MODEL = "google/flan-t5-large"
 
 
 # ----------------------------
@@ -64,17 +59,6 @@ def get_torch_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-def get_pipeline_device() -> int:
-    """
-    Hugging Face pipeline uses:
-    device = 0 for GPU
-    device = -1 for CPU
-    """
-    if torch.cuda.is_available():
-        return 0
-    return -1
 
 
 @st.cache_resource(show_spinner="Loading image captioning model...")
@@ -118,21 +102,23 @@ def load_vqa_model():
     return processor, model, device
 
 
-@st.cache_resource(show_spinner="Loading GPT-2 story model...")
-def load_story_pipeline():
+@st.cache_resource(show_spinner="Loading FLAN-T5 Large story model...")
+def load_story_model():
     """
-    Load GPT-2 using Hugging Face text-generation pipeline.
+    Load FLAN-T5 Large for instruction-following story generation.
 
-    This follows the professor's template more closely because it uses:
-    pipeline("text-generation", model="gpt2")
+    FLAN-T5 is a sequence-to-sequence model, so we use:
+    AutoTokenizer + AutoModelForSeq2SeqLM.
     """
-    story_pipe = pipeline(
-        task="text-generation",
-        model=STORY_MODEL,
-        device=get_pipeline_device(),
-    )
+    device = get_torch_device()
 
-    return story_pipe
+    tokenizer = AutoTokenizer.from_pretrained(STORY_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(STORY_MODEL)
+
+    model.to(device)
+    model.eval()
+
+    return tokenizer, model, device
 
 
 def generate_basic_caption(image: Image.Image) -> str:
@@ -409,54 +395,72 @@ def parse_scenario(text: str) -> Dict[str, str]:
 
 def build_story_prompt(text: str) -> str:
     """
-    Build a GPT-2-friendly story starter.
+    Build a clear image-grounded story prompt.
 
-    GPT-2 is not as good at following strict instructions as FLAN-T5 or Qwen.
-    Therefore, the prompt is written as a story starter instead of a long command.
+    This prompt explicitly asks the model to create:
+    - beginning
+    - middle
+    - ending
     """
     details = parse_scenario(text)
 
-    prompt = (
-        "Children's story for ages 3 to 10.\n"
-        f"Character: {details['character']}.\n"
-        f"Setting: {details['setting']}.\n"
-        f"Weather: {details['weather']}.\n"
-        f"Activity: {details['activity']}.\n"
-        f"Original scene: {details['caption']}.\n\n"
-        "The story has a clear beginning, middle, and happy ending. "
-        "It uses simple, safe, child-friendly English. "
-        "It does not include scary, violent, romantic, or adult content.\n\n"
-        f"Story: One day, {details['character']} was {details['setting']}. "
-    )
+    prompt = f"""
+Write one complete short story for children aged 3 to 10.
 
-    return prompt
+Use these picture details naturally:
+Character: {details["character"]}
+Setting: {details["setting"]}
+Weather or environment: {details["weather"]}
+Activity: {details["activity"]}
+Original caption: {details["caption"]}
+
+Story structure:
+Beginning: introduce the character, setting, and weather.
+Middle: describe a small action during the activity.
+Ending: finish with a happy, simple ending.
+
+Story requirements:
+- 70 to 90 words
+- simple child-friendly English
+- directly related to the picture details
+- do not list the details
+- do not mention the words "image", "caption", or "picture"
+- no scary, violent, romantic, or adult content
+
+Write only the story:
+"""
+    return prompt.strip()
 
 
 def generate_story_from_prompt(prompt: str) -> str:
     """
-    Generate a story using GPT-2 text-generation pipeline.
+    Generate a story using FLAN-T5 Large.
     """
-    story_pipe = load_story_pipeline()
+    tokenizer, model, device = load_story_model()
 
-    set_seed(42)
-
-    result = story_pipe(
+    inputs = tokenizer(
         prompt,
-        max_new_tokens=130,
-        do_sample=True,
-        temperature=0.75,
-        top_p=0.90,
-        repetition_penalty=1.20,
-        no_repeat_ngram_size=3,
-        num_return_sequences=1,
-        pad_token_id=story_pipe.tokenizer.eos_token_id,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
     )
 
-    raw_text = result[0]["generated_text"]
+    inputs = {key: value.to(device) for key, value in inputs.items()}
 
-    story = raw_text.replace(prompt, "").strip()
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            min_new_tokens=70,
+            max_new_tokens=150,
+            num_beams=4,
+            do_sample=False,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
 
-    return story
+    story = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return story.strip()
 
 
 def remove_sensitive_sentences(story: str) -> str:
@@ -562,6 +566,7 @@ def clean_story_text(story: str) -> str:
     """
     unwanted_labels = [
         "Story:",
+        "Write only the story:",
         "Beginning:",
         "Middle:",
         "Ending:",
@@ -584,26 +589,31 @@ def clean_story_text(story: str) -> str:
 
 def make_length_repair_prompt(story: str, scenario_text: str) -> str:
     """
-    Create a second GPT-2 prompt if the first story is too short.
-
-    Because GPT-2 is a continuation model, this repair prompt gives it
-    another story starter instead of asking it to strictly rewrite.
+    Create a second prompt if the first story is too short.
     """
     details = parse_scenario(scenario_text)
 
-    prompt = (
-        "Children's story for ages 3 to 10.\n"
-        f"Character: {details['character']}.\n"
-        f"Setting: {details['setting']}.\n"
-        f"Weather: {details['weather']}.\n"
-        f"Activity: {details['activity']}.\n"
-        f"Original scene: {details['caption']}.\n\n"
-        "This is a complete 70 to 90 word story with a beginning, middle, and happy ending. "
-        "The story is safe, warm, and easy for children to understand.\n\n"
-        f"Story: One day, {details['character']} was {details['setting']}. "
-    )
+    prompt = f"""
+Rewrite the story below so it is 70 to 90 words long.
 
-    return prompt
+Keep it child-friendly for ages 3 to 10.
+Keep a clear beginning, middle, and happy ending.
+Keep it directly related to these picture details:
+Character: {details["character"]}
+Setting: {details["setting"]}
+Weather or environment: {details["weather"]}
+Activity: {details["activity"]}
+Original caption: {details["caption"]}
+
+Do not mention the words "image", "caption", or "picture".
+Do not include scary, violent, romantic, or adult content.
+
+Story to rewrite:
+{story}
+
+Rewritten story:
+"""
+    return prompt.strip()
 
 
 def add_image_based_closing_sentence(story: str, scenario_text: str) -> str:
