@@ -6,6 +6,9 @@
 # 1. Import part
 # 2. Functions part
 # 3. Main part
+#
+# App flow:
+# Upload image -> extract image details -> generate story -> convert story to audio
 # ============================================================
 
 
@@ -36,14 +39,18 @@ from transformers import (
 # 2. MODEL SETTINGS
 # ----------------------------
 
-# Professor-suggested image captioning model
+# Image captioning model:
+# This model creates the first image caption from the uploaded picture.
 IMAGE_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# Extra image-understanding model
-# Used to extract character, setting, activity, and weather/environment.
+# Visual question answering model:
+# This model extracts additional image details such as character, setting,
+# activity, and weather/environment.
 VQA_MODEL = "dandelin/vilt-b32-finetuned-vqa"
 
-# Small instruction-following model for better story generation
+# Story generation model:
+# This small instruction-following model generates a child-friendly story
+# from the extracted image scenario.
 STORY_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 
@@ -51,9 +58,17 @@ STORY_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
 # 3. FUNCTIONS PART
 # ----------------------------
 
+
+# ============================================================
+# 3A. Device and model-loading functions
+# ============================================================
+
 def get_torch_device() -> torch.device:
     """
     Choose GPU if available, otherwise use CPU.
+
+    Returns:
+        torch.device: "cuda" if GPU is available, otherwise "cpu".
     """
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -65,6 +80,7 @@ def load_image_captioning_model():
     """
     Load BLIP image captioning model.
 
+    This model is responsible for the first image-to-text step.
     We use BlipProcessor and BlipForConditionalGeneration directly because
     some Streamlit Cloud environments may not recognize pipeline("image-to-text").
     """
@@ -106,8 +122,9 @@ def load_story_model():
     """
     Load a small instruction-following language model for story generation.
 
-    This is more suitable than FLAN-T5-base for generating a complete,
-    natural story with beginning, middle, and ending.
+    This model is used after img2text() creates the scenario.
+    It generates a complete child-friendly story with a beginning, middle,
+    and ending.
     """
     device = get_torch_device()
 
@@ -127,9 +144,19 @@ def load_story_model():
     return tokenizer, model, device
 
 
+# ============================================================
+# 3B. Image understanding functions
+# ============================================================
+
 def generate_basic_caption(image: Image.Image) -> str:
     """
     Generate the original image caption using BLIP.
+
+    Parameters:
+        image: Uploaded image opened as a PIL image.
+
+    Returns:
+        A short image caption.
     """
     processor, model, device = load_image_captioning_model()
 
@@ -149,6 +176,13 @@ def generate_basic_caption(image: Image.Image) -> str:
 def clean_short_answer(answer: str, fallback: str = "unknown") -> str:
     """
     Clean short VQA model answers.
+
+    Parameters:
+        answer: Raw answer from the VQA model.
+        fallback: Value returned when the answer is empty or not useful.
+
+    Returns:
+        A cleaned answer string.
     """
     if answer is None:
         return fallback
@@ -164,6 +198,13 @@ def clean_short_answer(answer: str, fallback: str = "unknown") -> str:
 def ask_vqa_question(image: Image.Image, question: str) -> str:
     """
     Ask a visual question about the uploaded image.
+
+    Parameters:
+        image: Uploaded image opened as a PIL image.
+        question: Question to ask about the image.
+
+    Returns:
+        A short answer from the VQA model.
     """
     try:
         processor, model, device = load_vqa_model()
@@ -191,6 +232,8 @@ def ask_vqa_question(image: Image.Image, question: str) -> str:
 def choose_character(caption: str, character_answer: str) -> str:
     """
     Choose a natural character phrase from the caption and VQA answer.
+
+    This avoids awkward labels and makes the story prompt easier to understand.
     """
     combined = f"{caption} {character_answer}".lower()
 
@@ -369,9 +412,19 @@ def img2text(url: str) -> str:
     return text
 
 
+# ============================================================
+# 3C. Story generation functions
+# ============================================================
+
 def parse_scenario(text: str) -> Dict[str, str]:
     """
     Parse scenario text into fields for the story prompt.
+
+    Parameters:
+        text: Scenario text returned by img2text().
+
+    Returns:
+        A dictionary containing character, setting, weather, activity, and caption.
     """
     fields = {
         "character": "someone",
@@ -439,6 +492,9 @@ Story:
 def format_prompt_for_chat_model(tokenizer, prompt: str) -> str:
     """
     Format prompt for an instruction/chat model if chat template is available.
+
+    Some instruction models provide a chat template. This helper uses it when
+    available and falls back to the plain prompt if not available.
     """
     messages = [
         {
@@ -494,9 +550,16 @@ def generate_story_from_prompt(prompt: str) -> str:
     return story.strip()
 
 
+# ============================================================
+# 3D. Story cleaning and validation functions
+# ============================================================
+
 def remove_sensitive_sentences(story: str) -> str:
     """
     Remove sentences containing content unsuitable for children aged 3-10.
+
+    This helps keep the generated story aligned with the assignment audience:
+    young children between 3 and 10 years old.
     """
     sensitive_words = [
         "wife",
@@ -555,6 +618,9 @@ def remove_sensitive_sentences(story: str) -> str:
 def keep_complete_sentences(story: str) -> str:
     """
     Keep complete sentences only.
+
+    This reduces the chance of displaying unfinished fragments if the model
+    ends generation in the middle of a sentence.
     """
     sentences = re.findall(r"[^.!?]+[.!?]", story)
 
@@ -567,6 +633,13 @@ def keep_complete_sentences(story: str) -> str:
 def limit_story_length(story: str, max_words: int = 100) -> str:
     """
     Limit story to the assignment word range upper limit.
+
+    Parameters:
+        story: Generated story text.
+        max_words: Maximum number of words allowed.
+
+    Returns:
+        Story text shortened to the maximum word count when needed.
     """
     words = story.split()
 
@@ -604,6 +677,13 @@ def story_is_valid_length(story: str) -> bool:
 def clean_story_text(story: str) -> str:
     """
     Clean the generated story.
+
+    Cleaning steps:
+    1. Remove unwanted labels.
+    2. Normalize spacing.
+    3. Remove unsuitable sentences.
+    4. Keep complete sentences.
+    5. Limit the story to 100 words.
     """
     unwanted_labels = [
         "Story:",
@@ -631,6 +711,9 @@ def clean_story_text(story: str) -> str:
 def make_length_repair_prompt(story: str, scenario_text: str) -> str:
     """
     Create a second prompt if the first story is too short.
+
+    The repair prompt asks the model to rewrite the generated story into
+    the assignment's expected 50-100 word range.
     """
     details = parse_scenario(scenario_text)
 
@@ -661,6 +744,8 @@ Rewritten story:
 def add_image_based_closing_sentence(story: str, scenario_text: str) -> str:
     """
     Add one final image-based sentence if the story is still under 50 words.
+
+    This is a final safeguard to help meet the assignment word-count requirement.
     """
     details = parse_scenario(scenario_text)
 
@@ -728,6 +813,12 @@ def text2story(text: str) -> str:
         def text2story(text):
             story_text = ...
             return story_text
+
+    Parameters:
+        text: Scenario text created by img2text().
+
+    Returns:
+        A child-friendly story between 50 and 100 words when possible.
     """
     prompt = build_story_prompt(text)
 
@@ -749,9 +840,15 @@ def text2story(text: str) -> str:
     return story_text
 
 
+# ============================================================
+# 3E. Text-to-speech functions
+# ============================================================
+
 def prepare_text_for_audio(story_text: str) -> str:
     """
     Prepare text for smoother text-to-speech.
+
+    Extra spaces after punctuation help the audio pause more naturally.
     """
     story_text = re.sub(r"\s+", " ", story_text).strip()
 
@@ -771,6 +868,12 @@ def text2audio(story_text: str) -> io.BytesIO:
         def text2audio(story_text):
             audio_data = ...
             return audio_data
+
+    Parameters:
+        story_text: Final generated story.
+
+    Returns:
+        Audio data in MP3 format, stored in a BytesIO object.
     """
     audio_text = prepare_text_for_audio(story_text)
 
@@ -788,9 +891,19 @@ def text2audio(story_text: str) -> io.BytesIO:
     return audio_data
 
 
+# ============================================================
+# 3F. Streamlit helper functions
+# ============================================================
+
 def save_uploaded_image(uploaded_file) -> str:
     """
     Save uploaded image locally, following the professor's template.
+
+    Parameters:
+        uploaded_file: File uploaded through st.file_uploader().
+
+    Returns:
+        Local image path used by img2text().
     """
     suffix = Path(uploaded_file.name).suffix.lower()
 
@@ -807,6 +920,59 @@ def save_uploaded_image(uploaded_file) -> str:
     return image_path
 
 
+def show_sidebar():
+    """
+    Show app explanation and model information in the sidebar.
+
+    This improves clarity for the user and makes model usage visible for grading.
+    """
+    st.sidebar.title("🦜 Storytelling App")
+    st.sidebar.write(
+        "This app turns an uploaded image into a short audio story for children."
+    )
+
+    st.sidebar.markdown("---")
+
+    st.sidebar.subheader("How it works")
+    st.sidebar.write(
+        "1. Upload a JPG or PNG image.\n"
+        "2. The app extracts image details.\n"
+        "3. The app writes a 50–100 word story.\n"
+        "4. The app reads the story aloud."
+    )
+
+    st.sidebar.markdown("---")
+
+    with st.sidebar.expander("Models used in this app"):
+        st.write("**Image captioning:** Salesforce/blip-image-captioning-base")
+        st.write("**Visual Q&A:** dandelin/vilt-b32-finetuned-vqa")
+        st.write("**Story generation:** HuggingFaceTB/SmolLM2-360M-Instruct")
+        st.write("**Text-to-speech:** gTTS")
+
+    with st.sidebar.expander("Assignment requirements covered"):
+        st.write("✅ Image upload")
+        st.write("✅ Image detail extraction")
+        st.write("✅ 50–100 word story generation")
+        st.write("✅ Audio conversion")
+        st.write("✅ Streamlit web interface")
+
+
+def show_word_count_status(story: str):
+    """
+    Display word count and whether it meets the assignment requirement.
+    """
+    word_count = count_words(story)
+
+    if story_is_valid_length(story):
+        st.success(
+            f"Word count: {word_count} words — meets the 50–100 word assignment requirement."
+        )
+    else:
+        st.warning(
+            f"Word count: {word_count} words — the story may not fully meet the 50–100 word requirement."
+        )
+
+
 # ----------------------------
 # 4. MAIN PART
 # ----------------------------
@@ -817,56 +983,87 @@ def main():
 
     Flow:
     upload image -> show image -> img2text -> text2story -> text2audio
+
+    This section controls the user interface only. The functional model logic
+    remains inside img2text(), text2story(), and text2audio().
     """
     st.set_page_config(
-        page_title="Your Image to Audio Story",
+        page_title="Image to Audio Story for Kids",
         page_icon="🦜",
         layout="centered",
     )
 
-    st.header("Turn Your Image to Audio Story")
-    st.write("Upload an image and the app will generate a short child-friendly story with audio.")
+    show_sidebar()
 
-    uploaded_file = st.file_uploader(
-        "Select an Image...",
-        type=["jpg", "jpeg", "png"],
-        key="story_image_uploader",
+    st.title("🦜 Turn an Image into a Short Audio Story for Kids")
+    st.write(
+        "Upload a JPG or PNG image. The app will describe the picture, "
+        "create a 50–100 word child-friendly story, and read it aloud."
     )
 
-    if uploaded_file is not None:
-        image_path = save_uploaded_image(uploaded_file)
+    st.divider()
 
-        st.image(
-            uploaded_file,
-            caption="Uploaded Image",
-            use_container_width=True,
-        )
+    uploaded_file = st.file_uploader(
+        "Select an image to begin",
+        type=["jpg", "jpeg", "png"],
+        key="story_image_uploader",
+        help="Please upload a JPG, JPEG, or PNG image.",
+    )
 
-        if st.button("Generate Story and Audio"):
-            try:
-                # Stage 1: Image to text
-                st.text("Processing img2text...")
+    if uploaded_file is None:
+        st.info("Please upload an image to start.")
+        return
+
+    image_path = save_uploaded_image(uploaded_file)
+
+    st.subheader("Uploaded Image")
+    st.image(
+        uploaded_file,
+        caption="Uploaded Image",
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    if st.button("Generate Story and Audio", type="primary"):
+        try:
+            # Stage 1: Image to text
+            with st.spinner("Step 1/3: Understanding the image..."):
                 scenario = img2text(image_path)
-                st.write(f"**Scenario:** {scenario}")
 
-                # Stage 2: Text to story
-                st.text("Generating a story...")
+            with st.expander("View extracted image details"):
+                st.write(scenario)
+
+            st.divider()
+
+            # Stage 2: Text to story
+            with st.spinner("Step 2/3: Writing a short child-friendly story..."):
                 story = text2story(scenario)
-                st.write(f"**Story:** {story}")
-                st.caption(f"Word count: {len(story.split())} words")
 
-                # Stage 3: Text to audio
-                st.text("Generating audio data...")
+            st.subheader("Generated Story")
+            st.write(story)
+            show_word_count_status(story)
+
+            st.divider()
+
+            # Stage 3: Text to audio
+            with st.spinner("Step 3/3: Creating audio..."):
                 audio_data = text2audio(story)
 
-                st.audio(audio_data, format="audio/mp3")
+            st.subheader("Audio Story")
+            st.audio(audio_data, format="audio/mp3")
 
-            except Exception as error:
-                st.error("Something went wrong while generating the story or audio.")
+            st.success("Story and audio generated successfully!")
+            st.info("Upload another image to create a new story.")
+
+        except Exception as error:
+            st.error(
+                "Something went wrong while generating the story or audio. "
+                "Please try a smaller image or refresh the app."
+            )
+
+            with st.expander("Technical error details"):
                 st.exception(error)
-
-    else:
-        st.info("Please upload an image to start.")
 
 
 if __name__ == "__main__":
